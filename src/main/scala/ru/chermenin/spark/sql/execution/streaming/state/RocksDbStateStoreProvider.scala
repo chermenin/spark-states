@@ -18,22 +18,24 @@ package ru.chermenin.spark.sql.execution.streaming.state
 
 import java.io.{File, FileInputStream, FileOutputStream, IOException}
 import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{FileVisitResult, Files, Paths, SimpleFileVisitor, StandardCopyOption, Path => LocalPath}
-import java.util.concurrent.ConcurrentHashMap
+import java.nio.file.{Path => LocalPath, _}
+import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import java.util.zip.{ZipEntry, ZipInputStream, ZipOutputStream}
 
+import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
-import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId, StateStoreMetrics, StateStoreProvider, UnsafeRowPair}
+import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.types.StructType
+import org.rocksdb._
 import org.rocksdb.util.SizeUnit
-import org.rocksdb.{CompactionStyle, CompressionType, Options, RocksDB}
+import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._
 
 import scala.collection.JavaConverters._
-import scala.util.Try
 import scala.util.control.NonFatal
+import scala.util.{Failure, Success, Try}
 
 /**
   * An implementation of [[StateStoreProvider]] and [[StateStore]] in which all the data is backed
@@ -48,7 +50,7 @@ import scala.util.control.NonFatal
   *
   * // get the right store
   * - val store = StateStore.get(
-  *      StateStoreId(checkpointLocation, operatorId, partitionId), ..., version, ...)
+  * StateStoreId(checkpointLocation, operatorId, partitionId), ..., version, ...)
   * - store.put(...)
   * - store.remove(...)
   * - store.commit()    // commits all the updates to made; the new version will be returned
@@ -59,13 +61,14 @@ import scala.util.control.NonFatal
   * - Every set of updates is written to a snapshot file before committing.
   * - The state store is responsible for cleaning up of old snapshot files.
   * - Multiple attempts to commit the same version of updates may overwrite each other.
-  *   Consistency guarantees depend on whether multiple attempts have the same updates and
-  *   the overwrite semantics of underlying file system.
+  * Consistency guarantees depend on whether multiple attempts have the same updates and
+  * the overwrite semantics of underlying file system.
   * - Background maintenance of files ensures that last versions of the store is always
-  *   recoverable to ensure re-executed RDD operations re-apply updates on the correct
-  *   past version of the store.
+  * recoverable to ensure re-executed RDD operations re-apply updates on the correct
+  * past version of the store.
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
+
 
   /** Load native RocksDb library */
   RocksDB.loadLibrary()
@@ -83,13 +86,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
                           val dbPath: String,
                           val keySchema: StructType,
                           val valueSchema: StructType,
-                          val localSnapshots: ConcurrentHashMap[Long, String]) extends StateStore {
+                          val localSnapshots: ConcurrentHashMap[Long, String],
+                          val keyCache: MapType) extends StateStore {
 
     /** New state version */
     private val newVersion = version + 1
 
     /** RocksDb database to keep state */
-    private val store: RocksDB = RocksDB.open(options, dbPath)
+    private val store: RocksDB = TtlDB.open(options, dbPath, ttlSec, false)
 
     /** Enumeration representing the internal state of the store */
     object State extends Enumeration {
@@ -108,11 +112,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * @return a non-null row if the key exists in the store, otherwise null.
       */
     override def get(key: UnsafeRow): UnsafeRow = {
-      val valueBytes = store.get(key.getBytes)
-      if (valueBytes == null) return null
-      val value = new UnsafeRow(valueSchema.fields.length)
-      value.pointTo(valueBytes, valueBytes.length)
-      value
+      if (isStrictExpire) {
+        Option(keyCache.getIfPresent(key)) match {
+          case Some(_) => getValue(key)
+          case None => null
+        }
+      } else getValue(key)
     }
 
     /**
@@ -125,6 +130,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val valueCopy = value.copy()
       synchronized {
         store.put(keyCopy.getBytes, valueCopy.getBytes)
+
+        if (isStrictExpire)
+          keyCache.put(keyCopy, DUMMY_VALUE)
       }
     }
 
@@ -135,6 +143,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
       synchronized {
         store.delete(key.getBytes)
+
+        if (isStrictExpire)
+          keyCache.invalidate(key.getBytes)
       }
     }
 
@@ -164,7 +175,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       try {
         state = State.Committed
-        keysNumber = store.getLongProperty(RocksDbStateStoreProvider.ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+        keysNumber =
+          if (isStrictExpire) keyCache.size
+          else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+
         store.close()
         putLocalSnapshot(newVersion, dbPath)
         snapshot(newVersion, dbPath)
@@ -183,7 +197,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       verify(state != State.Committed, "Cannot abort already committed state")
       try {
         state = State.Aborted
-        keysNumber = store.getLongProperty(RocksDbStateStoreProvider.ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+        keysNumber =
+          if (isStrictExpire) keyCache.size
+          else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+
         store.close()
         putLocalSnapshot(newVersion + 1, dbPath)
         logInfo(s"Aborted version $newVersion for $this")
@@ -197,31 +214,42 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Get an iterator of all the store data.
       * This can be called only after committing all the updates made in the current thread.
       */
-    override def iterator(): Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
+    override def iterator(): Iterator[UnsafeRowPair] = {
+      val stateFromRocksIter: Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
 
-      /** Internal RocksDb iterator */
-      private val iterator = store.newIterator()
-      iterator.seekToFirst()
+        /** Internal RocksDb iterator */
+        private val iterator = store.newIterator()
+        iterator.seekToFirst()
 
-      /** Check if has some data */
-      override def hasNext: Boolean = iterator.isValid
+        /** Check if has some data */
+        override def hasNext: Boolean = iterator.isValid
 
-      /** Get next data from RocksDb */
-      override def next(): UnsafeRowPair = {
-        iterator.status()
+        /** Get next data from RocksDb */
+        override def next(): UnsafeRowPair = {
+          iterator.status()
 
-        val key = new UnsafeRow(keySchema.fields.length)
-        val keyBytes = iterator.key()
-        key.pointTo(keyBytes, keyBytes.length)
+          val key = new UnsafeRow(keySchema.fields.length)
+          val keyBytes = iterator.key()
+          key.pointTo(keyBytes, keyBytes.length)
 
-        val value = new UnsafeRow(valueSchema.fields.length)
-        val valueBytes = iterator.value()
-        value.pointTo(valueBytes, valueBytes.length)
+          val value = new UnsafeRow(valueSchema.fields.length)
+          val valueBytes = iterator.value()
+          value.pointTo(valueBytes, valueBytes.length)
 
-        iterator.next()
+          iterator.next()
 
-        new UnsafeRowPair(key, value)
+          new UnsafeRowPair(key, value)
+        }
       }
+
+      val stateIter = {
+        val keys = keyCache.asMap().keySet()
+
+        if (isStrictExpire) stateFromRocksIter.filter(x => keys.contains(x.key))
+        else stateFromRocksIter
+      }
+
+      stateIter
     }
 
     /**
@@ -250,6 +278,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .foreach(version => deleteFile(localSnapshots.get(version)))
       localSnapshots.put(version, dbPath)
     }
+
+    private def getValue(key: UnsafeRow): UnsafeRow = {
+      val valueBytes = store.get(key.getBytes)
+      if (valueBytes == null) return null
+      val value = new UnsafeRow(valueSchema.fields.length)
+      value.pointTo(valueBytes, valueBytes.length)
+      value
+    }
   }
 
   /* Internal fields and methods */
@@ -261,6 +297,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var storeConf: StateStoreConf = _
   @volatile private var hadoopConf: Configuration = _
   @volatile private var tempDir: String = _
+  @volatile private var ttlSec: Int = _
+  @volatile private var isStrictExpire: Boolean = _
 
   private def baseDir: Path = stateStoreId.storeCheckpointLocation()
 
@@ -291,6 +329,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
     this.tempDir = getTempDir(getTempPrefix(hadoopConf.get("spark.app.name")), "")
+    this.ttlSec = setTTL(storeConf.confs)
+    this.isStrictExpire = setExpireMode(storeConf.confs)
+
     fs.mkdirs(baseDir)
   }
 
@@ -305,7 +346,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val versions = (snapshotVersions ++ localVersions).filter(_ <= version)
 
     def initStateStore(path: String): StateStore =
-      new RocksDbStateStore(version, path, keySchema, valueSchema, localSnapshots)
+      new RocksDbStateStore(version, path, keySchema, valueSchema, localSnapshots, createCache(ttlSec))
 
     val stateStore = versions.sorted(Ordering.Long.reverse)
       .map(version => Try(loadDb(version)).map(initStateStore))
@@ -592,12 +633,15 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       }
     })
   }
+
+
 }
 
 /**
   * Companion object with constants.
   */
 object RocksDbStateStoreProvider {
+  type MapType = com.google.common.cache.LoadingCache[UnsafeRow, String]
 
   /** Default write buffer size for RocksDb in megabytes */
   val DEFAULT_WRITE_BUFFER_SIZE_MB = 200
@@ -609,4 +653,45 @@ object RocksDbStateStoreProvider {
   val DEFAULT_BACKGROUND_COMPACTIONS = 10
 
   val ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY = "rocksdb.estimate-num-keys"
+
+  final val STATE_EXPIRY_SECS: String = "spark.sql.streaming.stateStore.stateExpirySecs"
+
+  final val DEFAULT_STATE_EXPIRY_SECS: String = "-1"
+
+  final val STATE_EXPIRY_STRICT_MODE: String = "spark.sql.streaming.stateStore.strictExpire"
+
+  final val DEFAULT_STATE_EXPIRY_METHOD: String = "false"
+
+  final val DUMMY_VALUE: String = ""
+
+  private def createCache(stateTtlSecs: Long): MapType = {
+    val loader = new CacheLoader[UnsafeRow, String] {
+      override def load(key: UnsafeRow): String = DUMMY_VALUE
+    }
+
+    val cacheBuilder = CacheBuilder.newBuilder()
+
+    val cacheBuilderWithOptions = {
+      if (stateTtlSecs >= 0)
+        cacheBuilder.expireAfterAccess(stateTtlSecs, TimeUnit.SECONDS)
+      else
+        cacheBuilder
+    }
+
+    cacheBuilderWithOptions.build[UnsafeRow, String](loader)
+  }
+
+  private def setTTL(conf: Map[String, String]): Int =
+
+    Try(conf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setExpireMode(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(STATE_EXPIRY_STRICT_MODE, DEFAULT_STATE_EXPIRY_METHOD).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
 }
