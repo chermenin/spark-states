@@ -31,5 +31,6 @@ libraryDependencies ++= Seq(
 
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
-  "org.apache.spark" %% "spark-sql" % sparkVersion % "test" classifier "tests"
+  "org.apache.spark" %% "spark-sql" % sparkVersion % "test" classifier "tests",
+  "com.google.guava" % "guava-testlib" % "14.0.1" % "test"
 )
