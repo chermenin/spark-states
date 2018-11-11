@@ -66,6 +66,26 @@ import scala.util.{Failure, Success, Try}
   * - Background maintenance of files ensures that last versions of the store is always
   * recoverable to ensure re-executed RDD operations re-apply updates on the correct
   * past version of the store.
+  *
+  * Description of State Timeout API
+  * --------------------------------
+  *
+  * This API should be used to open the db when key-values inserted are
+  * meant to be removed from the db in 'ttl' amount of time provided in seconds.
+  * The timeouts can be optionally set to strict expiration by setting
+  * spark.sql.streaming.stateStore.strictExpire = true on `SparkConf`
+  *
+  * Timeout Modes:
+  *  - In non strict mode (default), this guarantees that key-values inserted will remain in the db
+  *    for >= ttl amount of time and the db will make efforts to remove the key-values
+  *    as soon as possible after ttl seconds of their insertion.
+  *  - In strict mode, the key-values inserted will remain in the db for exactly ttl amount of time.
+  *    To ensure exact expiration, a separate cache of keys is maintained in memory with
+  *    their respective deadlines and is used for reference during operations.
+  *
+  * This API can be used to allow,
+  *  - Stateless Processing - set timeout to 0
+  *  - Infinite State (no timeout) - set timeout to -1, which is set by default.
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
