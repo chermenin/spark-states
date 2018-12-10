@@ -16,26 +16,17 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.File
 import java.util.UUID
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
-import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId, StateStoreProviderId, StateStoreTestsHelper}
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
-import org.scalatest.{BeforeAndAfter, FunSuite, PrivateMethodTester}
-import StateStoreTestsHelper._
+import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper._
+import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId, StateStoreProviderId}
+import org.scalatest.{BeforeAndAfter, FunSuite}
+import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreHelper._
 
 import scala.util.Random
 
-class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter with PrivateMethodTester {
-
-  val keySchema = StructType(Seq(StructField("key", StringType, nullable = true)))
-  val valueSchema = StructType(Seq(StructField("value", IntegerType, nullable = true)))
-
-  val key: String = "a"
-  val batchesToRetain: Int = 3
+class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
 
   before {
     StateStore.stop()
@@ -200,55 +191,4 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter with P
     assert(rowsToSet(store1reloaded.iterator()) === Set(key -> 2))
   }
 
-  def newStoreProvider(): RocksDbStateStoreProvider = {
-    createStoreProvider(opId = Random.nextInt(), partition = 0)
-  }
-
-  def newStoreProvider(storeId: StateStoreId): RocksDbStateStoreProvider = {
-    createStoreProvider(storeId.operatorId.toInt, storeId.partitionId, dir = storeId.checkpointRootLocation)
-  }
-
-  def getData(provider: RocksDbStateStoreProvider, version: Int = -1): Set[(String, Int)] = {
-    val reloadedProvider = newStoreProvider(provider.stateStoreId)
-    if (version < 0) {
-      reloadedProvider.latestIterator().map(rowsToStringInt).toSet
-    } else {
-      reloadedProvider.getStore(version).iterator().map(rowsToStringInt).toSet
-    }
-  }
-
-  def createStoreProvider(opId: Int, partition: Int, dir: String = newDir(),
-                          hadoopConf: Configuration = new Configuration): RocksDbStateStoreProvider = {
-    val sqlConf = new SQLConf()
-    sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, batchesToRetain)
-    val provider = new RocksDbStateStoreProvider()
-    provider.init(
-      StateStoreId(dir, opId, partition),
-      keySchema,
-      valueSchema,
-      indexOrdinal = None,
-      new StateStoreConf(sqlConf),
-      hadoopConf
-    )
-    provider
-  }
-
-  def snapshot(version: Int): String = s"state.snapshot.$version"
-
-  def fileExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
-    val method = PrivateMethod[Path]('baseDir)
-    val basePath = provider invokePrivate method()
-    val fileName = snapshot(version)
-    val filePath = new File(basePath.toString, fileName)
-    filePath.exists
-  }
-
-  def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Int): Unit = {
-    val method = PrivateMethod[Path]('baseDir)
-    val basePath = provider invokePrivate method()
-    val fileName = snapshot(version)
-    new File(basePath.toString, fileName).delete()
-  }
-
-  def minSnapshotToRetain(version: Int): Int = version - batchesToRetain + 1
 }
