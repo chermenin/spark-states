@@ -101,6 +101,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     .setCompressionType(CompressionType.SNAPPY_COMPRESSION)
     .setCompactionStyle(CompactionStyle.UNIVERSAL)
 
+  private val writeOptions = new WriteOptions()
+    .setDisableWAL(true) // disable write-ahead-log as Spark has it's own commit mechanism for micro-batches
+
   /** Implementation of [[StateStore]] API which is backed by RocksDB */
   class RocksDbStateStore(val version: Long,
                           val dbPath: String,
@@ -149,7 +152,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val keyCopy = key.copy()
       val valueCopy = value.copy()
       synchronized {
-        store.put(keyCopy.getBytes, valueCopy.getBytes)
+        store.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
 
         if (isStrictExpire)
           keyCache.put(keyCopy, DUMMY_VALUE)
