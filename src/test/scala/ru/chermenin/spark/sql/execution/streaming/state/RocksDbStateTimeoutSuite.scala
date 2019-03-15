@@ -51,14 +51,11 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
   before {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
-
-    clearDB(new File(testDBLocation))
   }
 
   after {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
-    clearDB(new File(testDBLocation))
   }
 
   test("no timeout") {
@@ -193,7 +190,7 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
     val cache = createMockCache(ttl, ticker)
 
     val provider = createStoreProvider(opId = Random.nextInt(), partition = Random.nextInt(), sqlConf = sqlConf)
-    val store = new provider.RocksDbStateStore(0, testDBLocation, keySchema, valueSchema, new ConcurrentHashMap, cache)
+    val store = provider.getStore(0, cache)
 
     (ticker, store)
   }

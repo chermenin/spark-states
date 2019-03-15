@@ -24,9 +24,11 @@ import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper.{new
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
+import org.rocksdb.BackupEngine
 import org.scalatest.PrivateMethodTester
 
 import scala.util.Random
+import scala.collection.JavaConverters._
 
 object RocksDbStateStoreHelper extends PrivateMethodTester {
 
@@ -52,7 +54,7 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
   }
 
   def getData(provider: RocksDbStateStoreProvider, version: Int = -1): Set[(String, Int)] = {
-    val reloadedProvider = newStoreProvider(provider.stateStoreId)
+    val reloadedProvider = newStoreProvider(provider.stateStoreId.copy(storeName="getData"))
     if (version < 0) {
       reloadedProvider.latestIterator().map(rowsToStringInt).toSet
     } else {
@@ -62,7 +64,7 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def createStoreProvider(opId: Int,
                           partition: Int,
-                          dir: String = newDir(),
+                          dir: String = newDir().replace('\\','/'),
                           hadoopConf: Configuration = new Configuration,
                           sqlConf: SQLConf = new SQLConf(),
                           keySchema: StructType = keySchema,
@@ -82,29 +84,22 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def snapshot(version: Int): String = s"state.snapshot.$version"
 
-  def fileExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
-    val method = PrivateMethod[Path]('baseDir)
-    val basePath = provider invokePrivate method()
-    val fileName = snapshot(version)
-    val filePath = new File(basePath.toString, fileName)
-    filePath.exists
+  def backupExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
+    val method = PrivateMethod[BackupEngine]('backupEngine)
+    val backupEngine = provider invokePrivate method()
+    backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
   }
 
   def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Int): Unit = {
-    val method = PrivateMethod[Path]('baseDir)
-    val basePath = provider invokePrivate method()
-    val fileName = snapshot(version)
-    new File(basePath.toString, fileName).delete()
+    val method = PrivateMethod[BackupEngine]('backupEngine)
+    val backupEngine = provider invokePrivate method()
+    val backupId = backupEngine.getBackupInfo.asScala.find(_.appMetadata().toLong==version)
+      .getOrElse(throw new IllegalStateException(s"Couldn't find backup for version $version"))
+      .backupId
+    backupEngine.deleteBackup(backupId)
   }
 
   def minSnapshotToRetain(version: Int): Int = version - batchesToRetain + 1
-
-  def clearDB(file: File): Unit = {
-    if (file.isDirectory)
-      file.listFiles.foreach(clearDB)
-    if (file.exists && !file.delete)
-      throw new Exception(s"Unable to delete ${file.getAbsolutePath}")
-  }
 
   def contains(store: StateStore, key: String): Boolean =
     store.iterator.toSeq.map(_.key).contains(stringToRow(key))
