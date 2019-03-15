@@ -28,6 +28,7 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
   "org.apache.spark" %% "spark-streaming" % sparkVersion % "provided",
   "org.rocksdb" % "rocksdbjni" % "5.17.2",
+  "com.google.guava" % "guava" % "14.0.1", // override version because older version check expireAfterAccess as ">" which makes unit tests fail
 
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
