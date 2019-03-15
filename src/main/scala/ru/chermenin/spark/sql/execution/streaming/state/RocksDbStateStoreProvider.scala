@@ -98,16 +98,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /** Load native RocksDb library */
   RocksDB.loadLibrary()
 
-  private val options: Options = new Options()
-    .setCreateIfMissing(true)
-    .setWriteBufferSize(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_SIZE_MB * SizeUnit.MB)
-    .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
-    .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
-    .setCompressionType(CompressionType.NO_COMPRESSION) // RocksDBException: Compression type Snappy is not linked with the binary (Windows)
-    .setCompactionStyle(CompactionStyle.UNIVERSAL)
+  private var options: Options = _
 
-  private val writeOptions = new WriteOptions()
-    .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
+  private var writeOptions: WriteOptions = _
 
   /** Implementation of [[StateStore]] API which is backed by RocksDB */
   class RocksDbStateStore(val version: Long,
@@ -362,6 +355,15 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     localDbDir = createLocalDir(localDataDir+"/db")
 
     // initialize empty database
+    options = new Options()
+      .setCreateIfMissing(true)
+      .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
+      .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
+      .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
+      .setCompressionType(CompressionType.NO_COMPRESSION) // RocksDBException: Compression type Snappy is not linked with the binary (Windows)
+      .setCompactionStyle(CompactionStyle.UNIVERSAL)
+    writeOptions = new WriteOptions()
+      .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
     currentDb = openDb
 
     // copy backups from remote storage and init backup engine
@@ -676,6 +678,8 @@ object RocksDbStateStoreProvider {
   type MapType = com.google.common.cache.LoadingCache[UnsafeRow, String]
 
   /** Default write buffer size for RocksDb in megabytes */
+  final val WRITE_BUFFER_SIZE_MB: String = "spark.sql.streaming.stateStore.writeBufferSizeMb"
+
   val DEFAULT_WRITE_BUFFER_SIZE_MB = 200
 
   /** Default number of write buffers for RocksDb */
@@ -698,6 +702,14 @@ object RocksDbStateStoreProvider {
 
   final val DEFAULT_STATE_LOCAL_DIR: String = System.getProperty("java.io.tmpdir").replace('\\','/')
 
+  final val STATE_LOCAL_WAL_DIR: String = "spark.sql.streaming.stateStore.localWalDir"
+
+  final val DEFAULT_STATE_LOCAL_WAL_DIR: String = DEFAULT_STATE_LOCAL_DIR
+
+  final val STATE_ROTATING_BACKUP_KEYS: String = "spark.sql.streaming.stateStore.rotatingBackupKeys"
+
+  final val DEFAULT_STATE_ROTATING_BACKUP_KEYS: String = "false"
+
   final val DUMMY_VALUE: String = ""
 
   private def createCache(stateTtlSecs: Long): MapType = {
@@ -717,6 +729,12 @@ object RocksDbStateStoreProvider {
     cacheBuilderWithOptions.build[UnsafeRow, String](loader)
   }
 
+  private def setWriteBufferSizeMb(conf: Map[String, String]): Int =
+    Try(conf.getOrElse(WRITE_BUFFER_SIZE_MB, DEFAULT_WRITE_BUFFER_SIZE_MB).toInt) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
   private def setTTL(conf: Map[String, String]): Int =
     Try(conf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt) match {
       case Success(value) => value
@@ -731,6 +749,18 @@ object RocksDbStateStoreProvider {
 
   private def setLocalDir(conf: Map[String, String]): String =
     Try(conf.getOrElse(STATE_LOCAL_DIR, DEFAULT_STATE_LOCAL_DIR)) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setLocalWalDir(conf: Map[String, String]): String =
+    Try(conf.getOrElse(STATE_LOCAL_WAL_DIR, DEFAULT_STATE_LOCAL_WAL_DIR)) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setRotatingBackupKey(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(STATE_ROTATING_BACKUP_KEYS, DEFAULT_STATE_ROTATING_BACKUP_KEYS).toBoolean) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
