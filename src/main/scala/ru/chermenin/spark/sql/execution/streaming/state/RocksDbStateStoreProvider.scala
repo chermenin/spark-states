@@ -90,11 +90,12 @@ import scala.util.{Failure, Random, Success, Try}
   *
   * Notes
   * -----
-  * Attention: On windows deletion of Files which are written over java.nio is not possible in current java process.
+  * - Attention: On windows deletion of Files which are written over java.nio is not possible in current java process.
   * This is an old bug which might be solved in Java 10 or 11, see https://bugs.java.com/bugdatabase/view_bug.do?bug_id=4715154
   *
   *  TODO: It should be possible to configure WAL-Files in a separate (faster) location...
-  *  TODO: implement rotatingBackupKey
+  *  TODO: What happens when backupId overflows (backupId is an integer, but version is long)
+  *  TODO: Setting a compression type doesnt work on windows (libraries not linked)
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
@@ -208,7 +209,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         createBackup(newVersion)
 
-        logInfo(s"Committed version $newVersion for $this")
+        logInfo(s"Committed version $newVersion for $this, store has ~$keysNumber keys")
         newVersion
       } catch {
         case NonFatal(e) =>
@@ -313,6 +314,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var storeConf: StateStoreConf = _
   @volatile private var hadoopConf: Configuration = _
   @volatile private var localDataDir: String = _
+  @volatile private var localWalDataDir: String = _
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
   @volatile private var rotatingBackupKey: Boolean = _
@@ -352,6 +354,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
     this.localDataDir = createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
+    this.localWalDataDir = createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
     this.ttlSec = setTTL(storeConf.confs)
     this.isStrictExpire = setExpireMode(storeConf.confs)
     this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
@@ -372,6 +375,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
       .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
       .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
+      .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
       .setCompressionType(CompressionType.NO_COMPRESSION) // RocksDBException: Compression type Snappy is not linked with the binary (Windows)
       .setCompactionStyle(CompactionStyle.UNIVERSAL)
     writeOptions = new WriteOptions()
@@ -426,7 +430,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
     restoreDb(version)
     currentStore = new RocksDbStateStore(version, keySchema, valueSchema, currentDb, cache)
-    logInfo(s"Retrieved $currentStore for version $version of ${RocksDbStateStoreProvider.this} for update")
+    logInfo(s"Retrieved $currentStore for version $version")
     // return
     currentStore
   }
@@ -444,10 +448,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // close db and restore backup
       val tRestore = measureTime {
-        // TODO: is closing needed?
-        currentDb.close()
+        currentDb.close() // we need to close before restore
         val restoreOptions = new RestoreOptions(false)
-        backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localDbDir, restoreOptions)
+        backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
         currentDb = openDb
       }
       logDebug(s"restored db for version $version from local backup, took $tRestore secs")
@@ -475,6 +478,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * Do maintenance backing data files, including cleaning up old files
     */
   override def doMaintenance(): Unit = {
+    var sharedFilesSize: Long = 0
     val t = measureTime {
 
       // flush WAL to SST Files and do manual compaction
@@ -482,7 +486,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       currentDb.pauseBackgroundWork()
       currentDb.compactRange()
       currentDb.continueBackgroundWork()
-      currentDb.getPropery("")
+
+      // estimate db size
+      sharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath,"shared"))
+        .map(_.getLen).sum
 
       // cleanup old backups
       backupEngine.purgeOldBackups(storeConf.minVersionsToRetain)
@@ -494,9 +501,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .map( v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
         .foreach( f => remoteBackupFs.delete( f, false))
       removedBackups.foreach(backupList.remove)
-      logDebug(s"index contains the following backups after doMaintenance: ${backupList.mkString(", ")}")
+      syncRemoteIndex()
+      logDebug(s"backup list after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
     }
-    logInfo(s"doMaintenance took $t secs")
+    logInfo(s"doMaintenance took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
   }
 
   def measureTime[T](code2exec: => Unit): Float = {
@@ -534,16 +542,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logDebug(s"created backup for version $version with backupId $backupId, took $tBackup secs")
 
     // sync to remote filesystem
+    var backupKey = ""
     val tSync = measureTime {
-      syncRemoteBackup(backupId, version)
+      backupKey = syncRemoteBackup(backupId, version)
     }
-    logDebug(s"synced backup to remote filesystem, took $tSync secs")
+    logDebug(s"synced version $version backupId $backupId to remote filesystem with backupKey $backupKey, took $tSync secs")
   }
 
   /**
     * copy local backup to remote filesystem
     */
-  private def syncRemoteBackup(backupId: Int, version: Long): Unit = {
+  private def syncRemoteBackup(backupId: Int, version: Long): String = {
 
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
@@ -554,7 +563,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     )
 
     // save metadata & private files as zip archive
-    val backupKey = nbToChar((version % storeConf.minVersionsToRetain).toInt)
+    val backupKey = if (rotatingBackupKey) nbToChar((version % storeConf.minVersionsToRetain).toInt)
+      else version.toString
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
     compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"), Some(localBackupDir))
@@ -569,6 +579,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     sharedFiles2Del.foreach( f =>
       remoteBackupFs.delete(f, false)
     )
+
+    //return
+    backupKey
   }
 
   /**
