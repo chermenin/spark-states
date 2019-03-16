@@ -128,8 +128,10 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
     corruptSnapshot(provider, snapshotVersion - 1)
     corruptSnapshot(provider, snapshotVersion - 2)
 
-    // If no correct snapshots, create empty state
-    assert(getData(provider, snapshotVersion) === Set())
+    // If no correct snapshots, throw exception
+    intercept[IllegalStateException] {
+      getData(provider, snapshotVersion)
+    }
   }
 
   test("Reports metrics") {

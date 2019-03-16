@@ -17,20 +17,23 @@
 package ru.chermenin.spark.sql.execution.streaming.state
 
 import java.io.File
+import java.util.zip.ZipInputStream
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
 import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper.{newDir, rowsToStringInt, stringToRow}
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 import org.rocksdb.BackupEngine
 import org.scalatest.PrivateMethodTester
+import org.apache.spark.internal.Logging
 
 import scala.util.Random
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
-object RocksDbStateStoreHelper extends PrivateMethodTester {
+object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
 
   val keySchema = StructType(Seq(StructField("key", StringType, nullable = true)))
   val valueSchema = StructType(Seq(StructField("value", IntegerType, nullable = true)))
@@ -91,12 +94,25 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
   }
 
   def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Int): Unit = {
-    val method = PrivateMethod[BackupEngine]('backupEngine)
-    val backupEngine = provider invokePrivate method()
+
+    // delete local backup
+    val backupEngineMethod = PrivateMethod[BackupEngine]('backupEngine)
+    val backupEngine = provider invokePrivate backupEngineMethod()
     val backupId = backupEngine.getBackupInfo.asScala.find(_.appMetadata().toLong==version)
       .getOrElse(throw new IllegalStateException(s"Couldn't find backup for version $version"))
       .backupId
     backupEngine.deleteBackup(backupId)
+
+    // remove from index
+    val backupList = getProviderPrivateProperty[mutable.HashMap[Long,(Int,String)]](provider, 'backupList)
+    backupList.remove(version)
+    getProviderPrivateProperty[Unit](provider, 'syncRemoteIndex) // call this as a function
+    logInfo( s"corrupted snapshot version $version, backupId $backupId")
+  }
+
+  def getProviderPrivateProperty[T](provider: RocksDbStateStoreProvider, property: Symbol): T = {
+    val method = PrivateMethod[T](property)
+    provider invokePrivate method()
   }
 
   def minSnapshotToRetain(version: Int): Int = version - batchesToRetain + 1

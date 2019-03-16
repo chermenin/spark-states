@@ -19,12 +19,12 @@ package ru.chermenin.spark.sql.execution.streaming.state
 import java.io.{File, FileInputStream, FileOutputStream, IOException}
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{Path => LocalPath, _}
-import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.TimeUnit
 import java.util.zip.{ZipEntry, ZipInputStream, ZipOutputStream}
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, FileSystem, FileUtil, Path, PathFilter}
+import org.apache.hadoop.fs.{FileSystem, FileUtil, Path, PathFilter}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.state._
@@ -34,6 +34,8 @@ import org.rocksdb.util.SizeUnit
 import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
+import scala.io.Source
 import scala.util.control.NonFatal
 import scala.util.{Failure, Random, Success, Try}
 
@@ -45,20 +47,17 @@ import scala.util.{Failure, Random, Success, Try}
   * (by retries in RDD operations) on the correct version of the store, and regenerate
   * the store version.
   * RocksDB Files will be kept in local filesystem and state store versions are uploaded to remote
-  * filesystem on commit. To do efficient versioning, sRocksDB backup functionality can be used which
+  * filesystem on commit. To do efficient versioning, RocksDB's backup functionality can be used which
   * saves incremental backups to another location in the local filesystem.
   *
   * Usage:
-  * To update the data in the state store, the following order of operations are needed.
-  *
+  * To update the data in the state store, the following order of operations are needed:
   * // get the right store
-  * - val store = StateStore.get(
-  * StateStoreId(checkpointLocation, operatorId, partitionId), ..., version, ...)
+  * - val store = StateStore.get(StateStoreId(checkpointLocation, operatorId, partitionId), ..., version, ...)
   * - store.put(...)
   * - store.remove(...)
   * - store.commit()    // commits all the updates to made; the new version will be returned
   * - store.iterator()  // key-value data after last commit as an iterator
-  * - store.updates()   // updates made in the last commit as an iterator
   *
   * Fault-tolerance model:
   * - Every set of updates is written to RocksDB WAL (write ahead log) while committing.
@@ -72,7 +71,6 @@ import scala.util.{Failure, Random, Success, Try}
   *
   * Description of State Timeout API
   * --------------------------------
-  *
   * This API should be used to open the db when key-values inserted are
   * meant to be removed from the db in 'ttl' amount of time provided in seconds.
   * The timeouts can be optionally set to strict expiration by setting
@@ -90,6 +88,11 @@ import scala.util.{Failure, Random, Success, Try}
   *  - Stateless Processing - set timeout to 0
   *  - Infinite State (no timeout) - set timeout to -1, which is set by default.
   *
+  * Notes
+  * -----
+  * Attention: On windows deletion of Files which are written over java.nio is not possible in current java process.
+  * This is an old bug which might be solved in Java 10 or 11, see https://bugs.java.com/bugdatabase/view_bug.do?bug_id=4715154
+  *
   *  TODO: It should be possible to configure WAL-Files in a separate (faster) location...
   *  TODO: implement rotatingBackupKey
   */
@@ -99,7 +102,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   RocksDB.loadLibrary()
 
   private var options: Options = _
-
   private var writeOptions: WriteOptions = _
 
   /** Implementation of [[StateStore]] API which is backed by RocksDB */
@@ -129,12 +131,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * @return a non-null row if the key exists in the store, otherwise null.
       */
     override def get(key: UnsafeRow): UnsafeRow = {
-      if (isStrictExpire) {
-        Option(keyCache.getIfPresent(key)) match {
-          case Some(_) => getValue(key)
-          case None => null
-        }
-      } else getValue(key)
+      var returnValue: UnsafeRow = null
+      val t = measureTime{
+        returnValue = if (isStrictExpire) {
+          Option(keyCache.getIfPresent(key)) match {
+            case Some(_) => getValue(key)
+            case None => null
+          }
+        } else getValue(key)
+      }
+      logDebug(s"get $key took $t secs")
+      returnValue
     }
 
     /**
@@ -143,14 +150,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       */
     override def put(key: UnsafeRow, value: UnsafeRow): Unit = {
       verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
-      val keyCopy = key.copy()
-      val valueCopy = value.copy()
-      synchronized {
-        store.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
+      val t = measureTime {
+        val keyCopy = key.copy()
+        val valueCopy = value.copy()
+        synchronized {
+          store.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
 
-        if (isStrictExpire)
-          keyCache.put(keyCopy, DUMMY_VALUE)
+          if (isStrictExpire)
+            keyCache.put(keyCopy, DUMMY_VALUE)
+        }
       }
+      logDebug(s"put $key took $t secs")
     }
 
     /**
@@ -283,7 +293,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Custom toString implementation for this state store class.
       */
     override def toString: String =
-      s"RocksDbStateStore[id=(op=${id.operatorId},part=${id.partitionId}),remoteDir=$remoteBackupPath]"
+      s"RocksDbStateStore[op=${id.operatorId},part=${id.partitionId},remoteDir=$remoteBackupPath]"
 
     def getCommittedVersion: Option[Long] = if(hasCommitted) Some(newVersion) else None
 
@@ -305,7 +315,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var localDataDir: String = _
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
-
+  @volatile private var rotatingBackupKey: Boolean = _
   private var remoteBackupPath: Path = _
   private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
@@ -315,6 +325,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var currentDb: RocksDB = _
   private var currentStore: RocksDbStateStore = _
   private var backupEngine: BackupEngine = _
+  private var backupList: mutable.HashMap[Long,(Int,String)] = mutable.HashMap()
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -343,6 +354,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.localDataDir = createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
     this.ttlSec = setTTL(storeConf.confs)
     this.isStrictExpire = setExpireMode(storeConf.confs)
+    this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
 
     // initialize paths
     remoteBackupPath = stateStoreId.storeCheckpointLocation()
@@ -368,17 +380,34 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
+    backupList.clear
     if (remoteBackupFs.exists(remoteBackupPath)) {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath")
+
+      // read index file into backupList, otherwise extract backup information from archive files
+      Try {
+        val backupListInput = remoteBackupFs.open(new Path(remoteBackupPath, "index"))
+        val backupListParsed = Source.fromInputStream(backupListInput).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
+        backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
+        logDebug(s"index contains the following backups: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+      }.getOrElse {
+        backupList ++= getBackupListFromRemoteFiles
+        logWarning(s"index file not found on remote filesystem. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+      }
+
+      // load files
       val t = measureTime {
+
+        // copy shared files
         FileUtil.copy(remoteBackupFs, new Path(remoteBackupPath, "shared"), new File(localBackupDir + File.separator + "shared"), false, hadoopConf)
-        val archiveFiles = remoteBackupFs.listStatus(remoteBackupPath, new PathFilter {
-          override def accept(path: Path): Boolean = path.getName.endsWith(".zip")
-        })
-        archiveFiles.foreach(f => decompressFromRemote(f.getPath, localBackupDir))
+
+        // copy metadata/private files according to backupList in parallel
+        backupList.values.map{ case (backupId,backupKey) => s"$backupKey.zip" }.par
+          .foreach(filename => decompressFromRemote( new Path(remoteBackupPath, filename), localBackupDir))
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       }
-      logDebug(s"got state backup from remote filesystem $remoteBackupPath, took $t secs")
+      logInfo(s"got state backup from remote filesystem $remoteBackupPath, took $t secs")
+
     } else {
       logDebug(s"initializing state backup at $remoteBackupFs/$remoteBackupPath")
       remoteBackupFs.mkdirs( new Path(remoteBackupPath, "shared"))
@@ -394,6 +423,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   override def getStore(version: Long): StateStore = getStore(version,createCache(ttlSec))
   def getStore(version: Long, cache: MapType): StateStore = synchronized {
     require(version >= 0, "Version cannot be less than 0")
+    if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
     restoreDb(version)
     currentStore = new RocksDbStateStore(version, keySchema, valueSchema, currentDb, cache)
     logInfo(s"Retrieved $currentStore for version $version of ${RocksDbStateStoreProvider.this} for update")
@@ -404,13 +434,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   protected def restoreDb(version: Long): Unit = {
 
     // check if current db is desired version, else search in backups and restore
-    if (currentStore!=null && currentStore.getCommittedVersion.map(_==version).getOrElse(false)) {
+    if (currentStore!=null && currentStore.getCommittedVersion.contains(version)) {
       logDebug(s"Current db already has correct version $version. No restore required.")
     } else {
 
       // get infos about backup to recover
-      val backupInfos = backupEngine.getBackupInfo.asScala
-      val backupIdRecovery = backupInfos.find(_.appMetadata.toLong == version).map(_.backupId)
+      val backupIdRecovery = backupList.get(version).map{ case (b,k) => b }
         .getOrElse(throw new IllegalStateException(s"backup for version $version not found"))
 
       // close db and restore backup
@@ -424,11 +453,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"restored db for version $version from local backup, took $tRestore secs")
 
       // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
-      val newerBackups = backupInfos.filter(_.backupId > backupIdRecovery)
+      val newerBackups = backupList.filter{ case (v,(b,k)) => v > version}
       val tCleanup = measureTime {
-        newerBackups.foreach(backupInfo => backupEngine.deleteBackup(backupInfo.backupId))
+        newerBackups.foreach{ case (v,(b,k)) =>
+          backupEngine.deleteBackup(b)
+          backupList.remove(v)
+        }
       }
-      if (newerBackups.nonEmpty) logDebug(s"deleted newer backups for versions ${newerBackups.map(_.appMetadata()).mkString(", ")}, took $tCleanup secs")
+      if (newerBackups.nonEmpty) logDebug(s"deleted newer backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")}, took $tCleanup secs")
     }
   }
 
@@ -443,13 +475,26 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * Do maintenance backing data files, including cleaning up old files
     */
   override def doMaintenance(): Unit = {
-    // flush WAL to SST Files and do manual compaction
-    // TODO: measure time
     val t = measureTime {
+
+      // flush WAL to SST Files and do manual compaction
       currentDb.flush(new FlushOptions().setWaitForFlush(true))
+      currentDb.pauseBackgroundWork()
       currentDb.compactRange()
+      currentDb.continueBackgroundWork()
+      currentDb.getPropery("")
+
       // cleanup old backups
       backupEngine.purgeOldBackups(storeConf.minVersionsToRetain)
+
+      // remove cleaned up backups from remote filesystem and backup list
+      val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
+      val removedBackups = backupList.keys.filter( v => !backupInfoVersions.contains(v))
+      if (!rotatingBackupKey) removedBackups
+        .map( v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
+        .foreach( f => remoteBackupFs.delete( f, false))
+      removedBackups.foreach(backupList.remove)
+      logDebug(s"index contains the following backups after doMaintenance: ${backupList.mkString(", ")}")
     }
     logInfo(s"doMaintenance took $t secs")
   }
@@ -472,20 +517,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * Custom toString implementation for this state store provider class.
     */
   override def toString: String = {
-    s"RocksDbStateStoreProvider[" +
-      s"id = (op=${stateStoreId.operatorId},part=${stateStoreId.partitionId}),dir = $remoteBackupPath]"
+    s"RocksDbStateStoreProvider[op=${stateStoreId.operatorId},part=${stateStoreId.partitionId},dir=$remoteBackupPath]"
   }
 
   /**
-    * Remove CRC files and old logs before uploading.
+    * creates a backup of the current database for the version given
     */
-  private def removeCrcAndLogs(dbPath: String): Boolean = {
-    new File(dbPath).listFiles().filter(file => {
-      val name = file.getName.toLowerCase()
-      name.endsWith(".crc") || name.startsWith("log.old")
-    }).forall(_.delete())
-  }
-
   private def createBackup(version: Long): Unit = {
 
     // create local backup
@@ -503,8 +540,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logDebug(s"synced backup to remote filesystem, took $tSync secs")
   }
 
-  //private def getBackupEngine(): BackupEngine = backupEngine
-
+  /**
+    * copy local backup to remote filesystem
+    */
   private def syncRemoteBackup(backupId: Int, version: Long): Unit = {
 
     // diff shared data files
@@ -515,15 +553,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       remoteBackupFs.copyFromLocalFile(false, true, f, new Path(remoteBackupPath,"shared"))
     )
 
-    // save metadata as zip archive
+    // save metadata & private files as zip archive
+    val backupKey = nbToChar((version % storeConf.minVersionsToRetain).toInt)
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
-    compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$version.zip"), Some(localBackupDir))
+    compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"), Some(localBackupDir))
 
-    // update status
-    val latestOutputStream = remoteBackupFs.create( new Path(remoteBackupPath,"latest"), true)
-    latestOutputStream.writeBytes(s"version: $version, backupId: $backupId")
-    latestOutputStream.close()
+    // update index of backups
+    backupList.find{ case (v,(b,k)) => k == backupKey}
+      .foreach{ case (v,(b,k)) => backupList.remove(v)} // remove existing entry for this backup key
+    backupList.put(version, (backupId,backupKey))
+    syncRemoteIndex()
 
     // delete old data files
     sharedFiles2Del.foreach( f =>
@@ -531,6 +571,32 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     )
   }
 
+  /**
+    * update index on remote filesystem
+    */
+  private def syncRemoteIndex(): Unit = {
+    val indexOutputStream = new java.io.PrintStream(remoteBackupFs.create( new Path(remoteBackupPath,"index"), true))
+    backupList.toSeq.sortBy(_._1)
+      .foreach{ case (v,(b,k)) => indexOutputStream.println(s"version: $v, backupId: $b, backupKey: $k")}
+    indexOutputStream.close()
+  }
+
+  /**
+    * maps number to string composed of A-Z
+    */
+  private def nbToChar(nb: Int) = {
+    val chars = 'A' to 'Z'
+    def nbToCharRecursion( nb: Int ): String = {
+      val res = nb/chars.size
+      val rem = nb%chars.size
+      if(res>0) nbToCharRecursion(res) else "" +chars(rem)
+    }
+    nbToCharRecursion(nb)
+  }
+
+  /**
+    * compares the content of a local directory with a remote directory and returns list of files to copy and list of files to delete
+    */
   private def getRemoteSyncList( remotePath: Path, localPath: Path, nameFilter: String => Boolean, errorOnChange: Boolean ) = {
     val remoteFiles = remoteBackupFs.listStatus(remotePath, new PathFilter {
       override def accept(path: Path) = nameFilter(path.getName)
@@ -555,6 +621,34 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       .map(_.getPath)
 
     (files2Copy,files2Del)
+  }
+
+  /**
+    * reads archive files on remote filesystem and tries to reconstruct the index file
+    * this is only needed if index file got corrupted on remote filesystem
+    */
+  private def getBackupListFromRemoteFiles = {
+    // search and delete remote backup
+    val archiveFiles = remoteBackupFs.listStatus(remoteBackupPath, new PathFilter {
+      override def accept(path: Path): Boolean = path.getName.endsWith(".zip")
+    })
+    archiveFiles.map { f =>
+      val backupKey = f.getPath.getName.takeWhile(_ != '.')
+      val input = new ZipInputStream(remoteBackupFs.open(f.getPath))
+      val metaFileEntry = Iterator.continually(input.getNextEntry)
+        .takeWhile(_ != null)
+        .find(entry => entry.getName.matches(".*meta/[0-9]*"))
+        .getOrElse(throw new IllegalStateException(s"Couldn't find meta file in archive ${f.getPath}"))
+      val backupId = metaFileEntry.getName.reverse.takeWhile(_ != '/').reverse.toInt
+      // read metafile
+      val metaBuffer = new Array[Byte](1000) // metafile shouldn't be bigger than that...
+      input.read(metaBuffer)
+      val metaLines = new String(metaBuffer).lines.toSeq
+      val metaLineIdx = metaLines.indexWhere(_.startsWith("metadata"))
+      val version = metaLines(metaLineIdx + 1).toLong
+      input.close()
+      (version, (backupId,backupKey))
+    }.toMap
   }
 
   /**
@@ -615,10 +709,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
   }
 
+
+
   /**
     * Get name for local data directory.
-    *
-    * @return
     */
   private def getDataDirName(sparkJobName: String): String = {
     // we need a random number to allow multiple streaming queries running with different state stores in the same spark job.
@@ -643,11 +737,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   /**
     * Get iterator of all the data of the latest version of the store.
-    * Note that this will look up the files to determined the latest known version.
     */
   private[state] def latestIterator(): Iterator[UnsafeRowPair] = {
-    val maxBackupId = backupEngine.getBackupInfo.asScala.maxBy(_.backupId).appMetadata.toLong
-    getStore(maxBackupId).iterator()
+    val maxVersion = backupList.keys.max
+    getStore(maxVersion).iterator()
   }
 
   /**
@@ -730,7 +823,7 @@ object RocksDbStateStoreProvider {
   }
 
   private def setWriteBufferSizeMb(conf: Map[String, String]): Int =
-    Try(conf.getOrElse(WRITE_BUFFER_SIZE_MB, DEFAULT_WRITE_BUFFER_SIZE_MB).toInt) match {
+    Try(conf.getOrElse(WRITE_BUFFER_SIZE_MB, DEFAULT_WRITE_BUFFER_SIZE_MB.toString).toInt) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
