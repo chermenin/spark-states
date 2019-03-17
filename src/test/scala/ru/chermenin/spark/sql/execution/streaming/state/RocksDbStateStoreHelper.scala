@@ -73,6 +73,8 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
                           keySchema: StructType = keySchema,
                           valueSchema: StructType = valueSchema): RocksDbStateStoreProvider = {
     sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, batchesToRetain)
+    hadoopConf.set("spark.sql.streaming.checkpointFileManagerClass",
+      "ru.chermenin.spark.sql.execution.streaming.state.SimpleCheckpointFileManager")
     val provider = new RocksDbStateStoreProvider()
     provider.init(
       StateStoreId(dir, opId, partition),
@@ -125,6 +127,8 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
   def createSQLConf(stateTTLSec: Long, isStrict: Boolean): SQLConf = {
     val sqlConf: SQLConf = new SQLConf()
 
+    sqlConf.setConfString("spark.sql.streaming.checkpointFileManagerClass",
+      "ru.chermenin.spark.sql.execution.streaming.state.SimpleCheckpointFileManager")
     sqlConf.setConfString("spark.sql.streaming.stateStore.providerClass",
       "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
 
@@ -133,5 +137,4 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
 
     sqlConf
   }
-
 }

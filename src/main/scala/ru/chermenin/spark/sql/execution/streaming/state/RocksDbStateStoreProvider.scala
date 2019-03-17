@@ -320,7 +320,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var isStrictExpire: Boolean = _
   @volatile private var rotatingBackupKey: Boolean = _
   private var remoteBackupPath: Path = _
-  private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
   private var localBackupFs: FileSystem = _
   private var localBackupDir: String = _
@@ -363,9 +362,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // initialize paths
     remoteBackupPath = stateStoreId.storeCheckpointLocation()
-    remoteBackupFs = remoteBackupPath.getFileSystem(hadoopConf)
-    remoteBackupFs.setWriteChecksum(false)
-    remoteBackupFs.setVerifyChecksum(false)
     localBackupDir = createLocalDir(localDataDir+"/backup")
     localBackupPath = new Path("file:///"+localBackupDir)
     localBackupFs = localBackupPath.getFileSystem(hadoopConf)
@@ -406,8 +402,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       // load files
       val t = measureTime {
 
-        // copy shared files
-        FileUtil.copy(remoteBackupFs, new Path(remoteBackupPath, "shared"), new File(localBackupDir + File.separator + "shared"), false, hadoopConf)
+        // copy shared files in parallel
+        remoteBackupFm.list(new Path(remoteBackupPath, "shared")).toSeq
+          .par.foreach(f => copyRemoteFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false))
 
         // copy metadata/private files according to backupList in parallel
         backupList.values.map{ case (backupId,backupKey) => s"$backupKey.zip" }.par
@@ -567,7 +564,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // copy new data files in parallel
     sharedFiles2Copy.par.foreach( f =>
-      remoteBackupFs.copyFromLocalFile(false, true, f, new Path(remoteBackupPath,"shared"))
+      copyRemoteFile(f, new Path(remoteBackupPath,s"shared/${f.getName}"), false)
     )
 
     // save metadata & private files as zip archive
@@ -619,7 +616,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * compares the content of a local directory with a remote directory and returns list of files to copy and list of files to delete
     */
   private def getRemoteSyncList( remotePath: Path, localPath: Path, nameFilter: String => Boolean, errorOnChange: Boolean ) = {
-    val remoteFiles = remoteBackupFs.listStatus(remotePath, new PathFilter {
+    val remoteFiles = remoteBackupFm.list(remotePath, new PathFilter {
       override def accept(path: Path) = nameFilter(path.getName)
     }).toSeq
     val localFiles = localBackupFs.listStatus(localPath, new PathFilter {
@@ -650,7 +647,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def getBackupListFromRemoteFiles = {
     // search and delete remote backup
-    val archiveFiles = remoteBackupFs.listStatus(remoteBackupPath, new PathFilter {
+    val archiveFiles = remoteBackupFm.list(remoteBackupPath, new PathFilter {
       override def accept(path: Path): Boolean = path.getName.endsWith(".zip")
     })
     archiveFiles.map { f =>
@@ -730,7 +727,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
   }
 
-
+  def copyRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
+    org.apache.hadoop.io.IOUtils.copyBytes( remoteBackupFm.open(src), remoteBackupFm.createAtomic(dst, overwriteIfPossible), hadoopConf, true)
+  }
 
   /**
     * Get name for local data directory.
