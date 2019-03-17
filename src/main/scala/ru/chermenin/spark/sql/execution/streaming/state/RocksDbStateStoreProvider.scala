@@ -404,7 +404,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // copy shared files in parallel
         remoteBackupFm.list(new Path(remoteBackupPath, "shared")).toSeq
-          .par.foreach(f => copyRemoteFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false))
+          .par.foreach(f => copyRemoteToLocalFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false))
 
         // copy metadata/private files according to backupList in parallel
         backupList.values.map{ case (backupId,backupKey) => s"$backupKey.zip" }.par
@@ -564,7 +564,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // copy new data files in parallel
     sharedFiles2Copy.par.foreach( f =>
-      copyRemoteFile(f, new Path(remoteBackupPath,s"shared/${f.getName}"), false)
+      copyLocalToRemoteFile(f, new Path(remoteBackupPath,s"shared/${f.getName}"), false)
     )
 
     // save metadata & private files as zip archive
@@ -727,8 +727,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
   }
 
-  def copyRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
-    org.apache.hadoop.io.IOUtils.copyBytes( remoteBackupFm.open(src), remoteBackupFm.createAtomic(dst, overwriteIfPossible), hadoopConf, true)
+  def copyLocalToRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
+    org.apache.hadoop.io.IOUtils.copyBytes( localBackupFs.open(src), remoteBackupFm.createAtomic(dst, overwriteIfPossible), hadoopConf, true)
+  }
+
+  def copyRemoteToLocalFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
+    org.apache.hadoop.io.IOUtils.copyBytes( remoteBackupFm.open(src), localBackupFs.create(dst, overwriteIfPossible), hadoopConf, true)
   }
 
   /**
