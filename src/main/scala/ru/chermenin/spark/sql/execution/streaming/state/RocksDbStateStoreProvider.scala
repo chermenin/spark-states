@@ -482,11 +482,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val t = measureTime {
 
       // flush WAL to SST Files and do manual compaction
-      currentDb.flush(new FlushOptions().setWaitForFlush(true))
-      currentDb.pauseBackgroundWork()
-      currentDb.compactRange()
-      currentDb.continueBackgroundWork()
-
+      currentDb.synchronized {
+        currentDb.flush(new FlushOptions().setWaitForFlush(true))
+        currentDb.pauseBackgroundWork()
+        currentDb.compactRange()
+        currentDb.continueBackgroundWork()
+      }
       // estimate db size
       sharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath,"shared"))
         .map(_.getLen).sum
@@ -536,7 +537,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // create local backup
     val tBackup = measureTime {
       // Don't flush before backup, as also WAL is backuped. We can use WAL for efficient incremental backup
-      backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false) // create backup for version 0
+      currentDb.synchronized {
+        backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false) // create backup for version 0
+      }
     }
     val backupId = backupEngine.getBackupInfo.asScala.map(_.backupId()).max
     logDebug(s"created backup for version $version with backupId $backupId, took $tBackup secs")
