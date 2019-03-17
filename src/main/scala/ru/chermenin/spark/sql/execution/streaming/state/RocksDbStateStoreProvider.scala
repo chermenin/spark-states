@@ -94,9 +94,7 @@ import scala.util.{Failure, Random, Success, Try}
   * - Attention: On windows deletion of Files which are written over java.nio is not possible in current java process.
   * This is an old bug which might be solved in Java 10 or 11, see https://bugs.java.com/bugdatabase/view_bug.do?bug_id=4715154
   *
-  *  TODO: It should be possible to configure WAL-Files in a separate (faster) location...
   *  TODO: What happens when backupId overflows (backupId is an integer, but version is long)
-  *  TODO: Setting a compression type doesnt work on windows (libraries not linked)
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
@@ -368,7 +366,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     localDbDir = createLocalDir(localDataDir+"/db")
     remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
 
-
     // initialize empty database
     options = new Options()
       .setCreateIfMissing(true)
@@ -376,7 +373,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
       .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
       .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
-      .setCompressionType(CompressionType.NO_COMPRESSION) // RocksDBException: Compression type Snappy is not linked with the binary (Windows)
+      .setCompressionType(setCompressionType(storeConf.confs))
       .setCompactionStyle(CompactionStyle.UNIVERSAL)
     writeOptions = new WriteOptions()
       .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
@@ -827,6 +824,10 @@ object RocksDbStateStoreProvider {
 
   final val DEFAULT_STATE_ROTATING_BACKUP_KEYS: String = "false"
 
+  final val STATE_COMPRESSION_TYPE: String = "spark.sql.streaming.stateStore.compressionType"
+
+  final val DEFAULT_STATE_COMPRESSION_TYPE: String = null // NO_COMPRESSION
+
   final val DUMMY_VALUE: String = ""
 
   private def createCache(stateTtlSecs: Long): MapType = {
@@ -878,6 +879,12 @@ object RocksDbStateStoreProvider {
 
   private def setRotatingBackupKey(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(STATE_ROTATING_BACKUP_KEYS, DEFAULT_STATE_ROTATING_BACKUP_KEYS).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setCompressionType(conf: Map[String, String]): CompressionType =
+    Try(CompressionType.getCompressionType(conf.getOrElse(STATE_COMPRESSION_TYPE, DEFAULT_STATE_COMPRESSION_TYPE))) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
