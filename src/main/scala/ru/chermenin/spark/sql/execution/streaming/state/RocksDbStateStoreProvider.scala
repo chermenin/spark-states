@@ -27,6 +27,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, FileUtil, Path, PathFilter}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.types.StructType
 import org.rocksdb._
@@ -328,6 +329,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var currentStore: RocksDbStateStore = _
   private var backupEngine: BackupEngine = _
   private var backupList: mutable.HashMap[Long,(Int,String)] = mutable.HashMap()
+  private var remoteBackupFm: CheckpointFileManager = _
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -368,6 +370,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     localBackupPath = new Path("file:///"+localBackupDir)
     localBackupFs = localBackupPath.getFileSystem(hadoopConf)
     localDbDir = createLocalDir(localDataDir+"/db")
+    remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
+
 
     // initialize empty database
     options = new Options()
@@ -385,12 +389,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
     backupList.clear
-    if (remoteBackupFs.exists(remoteBackupPath)) {
+    if (remoteBackupFm.exists(remoteBackupPath)) {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath")
 
       // read index file into backupList, otherwise extract backup information from archive files
       Try {
-        val backupListInput = remoteBackupFs.open(new Path(remoteBackupPath, "index"))
+        val backupListInput = remoteBackupFm.open(new Path(remoteBackupPath, "index"))
         val backupListParsed = Source.fromInputStream(backupListInput).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
         backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
         logDebug(s"index contains the following backups: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
@@ -413,8 +417,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logInfo(s"got state backup from remote filesystem $remoteBackupPath, took $t secs")
 
     } else {
-      logDebug(s"initializing state backup at $remoteBackupFs/$remoteBackupPath")
-      remoteBackupFs.mkdirs( new Path(remoteBackupPath, "shared"))
+      logDebug(s"initializing state backup at $remoteBackupPath")
+      remoteBackupFm.mkdirs( new Path(remoteBackupPath, "shared"))
       backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       createBackup(0L)
     }
@@ -500,7 +504,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val removedBackups = backupList.keys.filter( v => !backupInfoVersions.contains(v))
       if (!rotatingBackupKey) removedBackups
         .map( v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
-        .foreach( f => remoteBackupFs.delete( f, false))
+        .foreach( f => remoteBackupFm.delete( f ))
       removedBackups.foreach(backupList.remove)
       syncRemoteIndex()
       logDebug(s"backup list after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
@@ -559,9 +563,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
+    logDebug(s"found ${sharedFiles2Copy.size} files to copy to remote filesystem and ${sharedFiles2Del.size} files to delete")
 
-    // copy new data files
-    sharedFiles2Copy.foreach( f =>
+    // copy new data files in parallel
+    sharedFiles2Copy.par.foreach( f =>
       remoteBackupFs.copyFromLocalFile(false, true, f, new Path(remoteBackupPath,"shared"))
     )
 
@@ -578,9 +583,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     backupList.put(version, (backupId,backupKey))
     syncRemoteIndex()
 
-    // delete old data files
-    sharedFiles2Del.foreach( f =>
-      remoteBackupFs.delete(f, false)
+    // delete old data files in parallel
+    sharedFiles2Del.par.foreach( f =>
+      remoteBackupFm.delete(f)
     )
 
     //return
@@ -591,7 +596,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * update index on remote filesystem
     */
   private def syncRemoteIndex(): Unit = {
-    val indexOutputStream = new java.io.PrintStream(remoteBackupFs.create( new Path(remoteBackupPath,"index"), true))
+    val indexOutputStream = new java.io.PrintStream(remoteBackupFm.createAtomic( new Path(remoteBackupPath,"index"), true))
     backupList.toSeq.sortBy(_._1)
       .foreach{ case (v,(b,k)) => indexOutputStream.println(s"version: $v, backupId: $b, backupKey: $k")}
     indexOutputStream.close()
@@ -650,7 +655,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     })
     archiveFiles.map { f =>
       val backupKey = f.getPath.getName.takeWhile(_ != '.')
-      val input = new ZipInputStream(remoteBackupFs.open(f.getPath))
+      val input = new ZipInputStream(remoteBackupFm.open(f.getPath))
       val metaFileEntry = Iterator.continually(input.getNextEntry)
         .takeWhile(_ != null)
         .find(entry => entry.getName.matches(".*meta/[0-9]*"))
@@ -672,7 +677,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def compress2Remote(files: Seq[File], archiveFile: Path, baseDir: Option[String] = None): Unit = {
     val buffer = new Array[Byte](hadoopConf.getInt("io.file.buffer.size", 4096))
-    val output = new ZipOutputStream(remoteBackupFs.create(archiveFile, true))
+    val output = new ZipOutputStream(remoteBackupFm.createAtomic(archiveFile, true))
     val basePath = baseDir.map( dir => new java.io.File(dir).toPath)
     try {
       files.foreach(file => {
@@ -701,7 +706,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def decompressFromRemote(archiveFile: Path, tgtPath: String): Unit = {
     val buffer = new Array[Byte](hadoopConf.getInt("io.file.buffer.size", 4096))
-    val input = new ZipInputStream(remoteBackupFs.open(archiveFile))
+    val input = new ZipInputStream(remoteBackupFm.open(archiveFile))
     try {
       Iterator.continually(input.getNextEntry)
         .takeWhile(_ != null)
