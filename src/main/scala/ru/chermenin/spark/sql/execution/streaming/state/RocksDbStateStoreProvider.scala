@@ -36,7 +36,6 @@ import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvide
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.io.Source
-import scala.util.control.NonFatal
 import scala.util.{Failure, Random, Success, Try}
 
 /**
@@ -131,7 +130,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       *
       * @return a non-null row if the key exists in the store, otherwise null.
       */
-    override def get(key: UnsafeRow): UnsafeRow = {
+    override def get(key: UnsafeRow): UnsafeRow = try {
       var returnValue: UnsafeRow = null
       val t = measureTime{
         returnValue = if (isStrictExpire) {
@@ -143,13 +142,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       }
       logDebug(s"get $key took $t secs")
       returnValue
+    } catch {
+      case e:Exception =>
+        logError(s"Error '${e.getMessage}' in method 'get' of $this")
+        throw e
     }
 
     /**
       * Put a new value for a non-null key. Implementations must be aware that the UnsafeRows in
       * the params can be reused, and must make copies of the data as needed for persistence.
       */
-    override def put(key: UnsafeRow, value: UnsafeRow): Unit = {
+    override def put(key: UnsafeRow, value: UnsafeRow): Unit = try {
       verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
       val t = measureTime {
         val keyCopy = key.copy()
@@ -162,12 +165,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         }
       }
       logDebug(s"put $key took $t secs")
+    } catch {
+      case e:Exception =>
+        logError(s"Error '${e.getMessage}' in method 'put' of $this")
+        throw e
     }
 
     /**
       * Remove a single non-null key.
       */
-    override def remove(key: UnsafeRow): Unit = {
+    override def remove(key: UnsafeRow): Unit = try {
       verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
       synchronized {
         store.delete(key.getBytes)
@@ -175,6 +182,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         if (isStrictExpire)
           keyCache.invalidate(key.getBytes)
       }
+    } catch {
+      case e:Exception =>
+        logError(s"Error '${e.getMessage}' in method 'remove' of $this")
+        throw e
     }
 
     /**
@@ -198,42 +209,41 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     /**
       * Commit all the updates that have been made to the store, and return the new version.
       */
-    override def commit(): Long = {
+    override def commit(): Long = try {
       verify(state == State.Updating, "Cannot commit already committed or aborted state")
 
-      try {
-        state = State.Committed
-        keysNumber =
-          if (isStrictExpire) keyCache.size
-          else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+      state = State.Committed
+      keysNumber =
+        if (isStrictExpire) keyCache.size
+        else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
 
-        createBackup(newVersion)
+      createBackup(newVersion)
 
-        logInfo(s"Committed version $newVersion for $this, store has ~$keysNumber keys")
-        newVersion
-      } catch {
-        case NonFatal(e) =>
-          throw new IllegalStateException(s"Error committing version $newVersion into $this", e)
-      }
+      logInfo(s"Committed version $newVersion for $this, store has ~$keysNumber keys")
+      newVersion
+
+    } catch {
+      case e:Exception =>
+        logError(s"Error '${e.getMessage}' in method 'commit' for version $newVersion of $this")
+        throw e
     }
 
     /**
       * Abort all the updates made on this store. This store will not be usable any more.
       */
-    override def abort(): Unit = {
+    override def abort(): Unit = try {
       verify(state != State.Committed, "Cannot abort already committed state")
-      try {
-        //TODO: how can we rollback uncommitted changes -> we should use a transaction!
-        state = State.Aborted
-        keysNumber =
-          if (isStrictExpire) keyCache.size
-          else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+      //TODO: how can we rollback uncommitted changes -> we should use a transaction!
+      state = State.Aborted
+      keysNumber =
+        if (isStrictExpire) keyCache.size
+        else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
 
-        logInfo(s"Aborted version $newVersion for $this")
-      } catch {
-        case e: Exception =>
-          logWarning(s"Error aborting version $newVersion into $this", e)
-      }
+      logInfo(s"Aborted version $newVersion for $this")
+
+    } catch {
+      case e: Exception =>
+        logWarning(s"Error aborting version $newVersion into $this", e)
     }
 
     /**
@@ -347,7 +357,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
                     valueSchema: StructType,
                     indexOrdinal: Option[Int],
                     storeConf: StateStoreConf,
-                    hadoopConf: Configuration): Unit = {
+                    hadoopConf: Configuration): Unit = try {
     this.stateStoreId_ = stateStoreId
     this.keySchema = keySchema
     this.valueSchema = valueSchema
@@ -419,12 +429,22 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       createBackup(0L)
     }
     logInfo(s"initialized $this")
+  } catch {
+    case e:Exception =>
+      logError(s"Error '${e.getMessage}' in method 'init' of $this")
+      throw e
   }
 
   /**
     * Get the state store for making updates to create a new `version` of the store.
     */
-  override def getStore(version: Long): StateStore = getStore(version,createCache(ttlSec))
+  override def getStore(version: Long): StateStore = try {
+    getStore(version, createCache(ttlSec))
+  } catch {
+    case e:Exception =>
+      logError(s"Error '${e.getMessage}' in method 'getStore' of $this")
+      throw e
+  }
   def getStore(version: Long, cache: MapType): StateStore = synchronized {
     require(version >= 0, "Version cannot be less than 0")
     if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
@@ -477,7 +497,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /**
     * Do maintenance backing data files, including cleaning up old files
     */
-  override def doMaintenance(): Unit = {
+  override def doMaintenance(): Unit = try {
     var sharedFilesSize: Long = 0
     val t = measureTime {
 
@@ -505,6 +525,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"backup list after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
     }
     logInfo(s"doMaintenance took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
+  } catch {
+    case e:Exception =>
+      logError(s"Error '${e.getMessage}' in method 'doMaintenance' of $this")
+      throw e
   }
 
   def measureTime[T](code2exec: => Unit): Float = {
@@ -516,9 +540,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /**
     * Called when the provider instance is unloaded from the executor.
     */
-  override def close(): Unit = {
+  override def close(): Unit = try {
     deleteFile(localDataDir)
     logInfo(s"Removed local db and backup dir of ${RocksDbStateStoreProvider.this}")
+  } catch {
+    case e:Exception =>
+      logError(s"Error '${e.getMessage}' in method 'close' of $this")
+      throw e
   }
 
   /**
