@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
+organization := "ru.chermenin"
 name := "spark-states"
 
-version := "0.1"
+version := "0.2-SNAPSHOT"
 
 crossScalaVersions := Seq("2.11.12", "2.12.7")
 
