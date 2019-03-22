@@ -140,11 +140,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         } else getValue(key)
       }
       val returnValueLog = if(returnValue!=null) "result size is "+returnValue.getSizeInBytes else "no value found"
-      logInfo(s"get $key took $t secs, $returnValueLog")
+      logInfo(s"get ${key.toSeq(keySchema)} took $t secs, $returnValueLog")
       returnValue
     } catch {
       case e:Exception =>
-        logError(s"Error '${e.getMessage}' in method 'get' of $this")
+        logError(s"Error '${e.getMessage}' in method 'get' key ${key.toSeq(keySchema)} of $this")
         throw e
     }
 
@@ -164,10 +164,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             keyCache.put(keyCopy, DUMMY_VALUE)
         }
       }
-      logInfo(s"put $key took $t secs, size is ${value.getSizeInBytes}")
+      logInfo(s"put ${key.toSeq(keySchema)} took $t secs, size is ${value.getSizeInBytes}")
     } catch {
       case e:Exception =>
-        logError(s"Error '${e.getMessage}' in method 'put' of $this")
+        logError(s"Error '${e.getMessage}' in method 'put' key ${key.toSeq(keySchema)} of $this")
         throw e
     }
 
