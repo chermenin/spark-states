@@ -24,7 +24,7 @@ import java.util.zip.{ZipEntry, ZipInputStream, ZipOutputStream}
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, FileUtil, Path, PathFilter}
+import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
@@ -139,7 +139,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           }
         } else getValue(key)
       }
-      logInfo(s"get $key took $t secs, size is ${returnValue.getSizeInBytes}")
+      val returnValueLog = if(returnValue!=null) "result size is "+returnValue.getSizeInBytes else "no value found"
+      logInfo(s"get $key took $t secs, $returnValueLog")
       returnValue
     } catch {
       case e:Exception =>
@@ -398,17 +399,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
     backupList.clear
     if (remoteBackupFm.exists(remoteBackupPath)) {
-      logDebug(s"loading state backup from remote filesystem $remoteBackupPath")
+      logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
       // read index file into backupList, otherwise extract backup information from archive files
       Try {
         val backupListInput = remoteBackupFm.open(new Path(remoteBackupPath, "index"))
         val backupListParsed = Source.fromInputStream(backupListInput).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
         backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-        logDebug(s"index contains the following backups: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+        logDebug(s"index contains the following backups for $this: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
       }.getOrElse {
         backupList ++= getBackupListFromRemoteFiles
-        logWarning(s"index file not found on remote filesystem. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+        logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
       }
 
       // load files
@@ -423,10 +424,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           .foreach(filename => decompressFromRemote( new Path(remoteBackupPath, filename), localBackupDir))
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       }
-      logInfo(s"got state backup from remote filesystem $remoteBackupPath, took $t secs")
+      logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
 
     } else {
-      logDebug(s"initializing state backup at $remoteBackupPath")
+      logDebug(s"initializing state backup at $remoteBackupPath for $this")
       remoteBackupFm.mkdirs( new Path(remoteBackupPath, "shared"))
       backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       createBackup(0L)
@@ -453,7 +454,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
     restoreDb(version)
     currentStore = new RocksDbStateStore(version, keySchema, valueSchema, currentDb, cache)
-    logInfo(s"Retrieved $currentStore for version $version")
+    logInfo(s"Retrieved $currentStore for $this version $version")
     // return
     currentStore
   }
@@ -462,7 +463,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // check if current db is desired version, else search in backups and restore
     if (currentStore!=null && currentStore.getCommittedVersion.contains(version)) {
-      logDebug(s"Current db already has correct version $version. No restore required.")
+      logDebug(s"Current db already has correct version $version. No restore required for $this.")
     } else {
 
       // get infos about backup to recover
@@ -476,7 +477,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
         currentDb = openDb
       }
-      logDebug(s"restored db for version $version from local backup, took $tRestore secs")
+      logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
 
       // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
       val newerBackups = backupList.filter{ case (v,(b,k)) => v > version}
@@ -486,7 +487,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           backupList.remove(v)
         }
       }
-      if (newerBackups.nonEmpty) logDebug(s"deleted newer backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")}, took $tCleanup secs")
+      if (newerBackups.nonEmpty) logDebug(s"deleted newer backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
     }
   }
 
@@ -527,7 +528,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .foreach( f => remoteBackupFm.delete( f ))
       removedBackups.foreach(backupList.remove)
       syncRemoteIndex()
-      logDebug(s"backup list after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+      logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
 
       // log statistics
       val statsTypes = Seq(
@@ -536,9 +537,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         , TickerType.BLOCK_CACHE_HIT, TickerType.BLOCK_CACHE_MISS
         , TickerType.BYTES_READ, TickerType.BYTES_WRITTEN
       )
-      logInfo("rocksdb statistics: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
+      logInfo(s"rocksdb statistics for $this: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
     }
-    logInfo(s"doMaintenance took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
+    logInfo(s"doMaintenance for $this took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
   } catch {
     case e:Exception =>
       logError(s"Error '${e.getMessage}' in method 'doMaintenance' of $this")
@@ -556,7 +557,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   override def close(): Unit = try {
     deleteFile(localDataDir)
-    logInfo(s"Removed local db and backup dir of ${RocksDbStateStoreProvider.this}")
+    logInfo(s"Removed local db and backup dir of $this")
   } catch {
     case e:Exception =>
       logError(s"Error '${e.getMessage}' in method 'close' of $this")
@@ -583,14 +584,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       }
     }
     val backupId = backupEngine.getBackupInfo.asScala.map(_.backupId()).max
-    logDebug(s"created backup for version $version with backupId $backupId, took $tBackup secs")
+    logDebug(s"created backup for $this version $version with backupId $backupId, took $tBackup secs")
 
     // sync to remote filesystem
     var backupKey = ""
     val tSync = measureTime {
       backupKey = syncRemoteBackup(backupId, version)
     }
-    logDebug(s"synced version $version backupId $backupId to remote filesystem with backupKey $backupKey, took $tSync secs")
+    logDebug(s"synced $this version $version backupId $backupId to remote filesystem with backupKey $backupKey, took $tSync secs")
   }
 
   /**
@@ -600,7 +601,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
-    logDebug(s"found ${sharedFiles2Copy.size} files to copy to remote filesystem and ${sharedFiles2Del.size} files to delete")
+    logDebug(s"found ${sharedFiles2Copy.size} files to copy to remote filesystem and ${sharedFiles2Del.size} files to delete for $this")
 
     // copy new data files in parallel
     sharedFiles2Copy.par.foreach( f =>
