@@ -30,7 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.types.StructType
-import org.rocksdb._
+import org.rocksdb.{TickerType, _}
 import org.rocksdb.util.SizeUnit
 import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._
 
@@ -139,7 +139,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           }
         } else getValue(key)
       }
-      logDebug(s"get $key took $t secs")
+      logInfo(s"get $key took $t secs, size is ${returnValue.getSizeInBytes}")
       returnValue
     } catch {
       case e:Exception =>
@@ -163,7 +163,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             keyCache.put(keyCopy, DUMMY_VALUE)
         }
       }
-      logDebug(s"put $key took $t secs")
+      logInfo(s"put $key took $t secs, size is ${value.getSizeInBytes}")
     } catch {
       case e:Exception =>
         logError(s"Error '${e.getMessage}' in method 'put' of $this")
@@ -333,6 +333,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var localBackupDir: String = _
   private var localDbDir: String = _
   private var currentDb: RocksDB = _
+  private val currentDbStats: Statistics = new Statistics()
   private var currentStore: RocksDbStateStore = _
   private var backupEngine: BackupEngine = _
   private var backupList: mutable.HashMap[Long,(Int,String)] = mutable.HashMap()
@@ -377,10 +378,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
 
     // initialize empty database
+    currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
+
     options = new Options()
+      .setStatistics(currentDbStats)
       .setCreateIfMissing(true)
       .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
       .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
+      //.setTargetFileSizeBase(xxx * SizeUnit.MB))
       .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
       .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
       .setCompressionType(setCompressionType(storeConf.confs))
@@ -506,6 +511,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         currentDb.compactRange()
         currentDb.continueBackgroundWork()
       }
+
       // estimate db size
       sharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath,"shared"))
         .map(_.getLen).sum
@@ -522,6 +528,15 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       removedBackups.foreach(backupList.remove)
       syncRemoteIndex()
       logDebug(s"backup list after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+
+      // log statistics
+      val statsTypes = Seq(
+          TickerType.NUMBER_KEYS_READ, TickerType.NUMBER_KEYS_UPDATED, TickerType.NUMBER_KEYS_WRITTEN
+        , TickerType.MEMTABLE_HIT, TickerType.MEMTABLE_MISS
+        , TickerType.BLOCK_CACHE_HIT, TickerType.BLOCK_CACHE_MISS
+        , TickerType.BYTES_READ, TickerType.BYTES_WRITTEN
+      )
+      logInfo("rocksdb statistics: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
     }
     logInfo(s"doMaintenance took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
   } catch {
