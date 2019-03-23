@@ -107,7 +107,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   class RocksDbStateStore(val version: Long,
                           val keySchema: StructType,
                           val valueSchema: StructType,
-                          val store: RocksDB,
                           val keyCache: MapType) extends StateStore {
 
     /** New state version */
@@ -158,7 +157,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         val keyCopy = key.copy()
         val valueCopy = value.copy()
         synchronized {
-          store.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
+          currentDb.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
 
           if (isStrictExpire)
             keyCache.put(keyCopy, DUMMY_VALUE)
@@ -177,7 +176,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def remove(key: UnsafeRow): Unit = try {
       verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
       synchronized {
-        store.delete(key.getBytes)
+        currentDb.delete(key.getBytes)
 
         if (isStrictExpire)
           keyCache.invalidate(key.getBytes)
@@ -213,11 +212,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       verify(state == State.Updating, "Cannot commit already committed or aborted state")
 
       state = State.Committed
-      keysNumber =
-        if (isStrictExpire) keyCache.size
-        else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+      synchronized {
+        keysNumber =
+          if (isStrictExpire) keyCache.size
+          else currentDb.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
 
-      createBackup(newVersion)
+        if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
+          createBackup(newVersion)
+          currentDb.close
+          currentDb = null
+        }
+      }
 
       logInfo(s"Committed version $newVersion for $this, store has ~$keysNumber keys")
       newVersion
@@ -234,10 +239,18 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def abort(): Unit = try {
       verify(state != State.Committed, "Cannot abort already committed state")
       //TODO: how can we rollback uncommitted changes -> we should use a transaction!
+
       state = State.Aborted
-      keysNumber =
-        if (isStrictExpire) keyCache.size
-        else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+      synchronized {
+        keysNumber =
+          if (isStrictExpire) keyCache.size
+          else currentDb.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+
+        if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
+          currentDb.close()
+          currentDb = null
+        }
+      }
 
       logInfo(s"Aborted version $newVersion for $this")
 
@@ -254,7 +267,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val stateFromRocksIter: Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
 
         /** Internal RocksDb iterator */
-        private val iterator = store.newIterator()
+        private val iterator = currentDb.newIterator()
         iterator.seekToFirst()
 
         /** Check if has some data */
@@ -309,7 +322,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     def getCommittedVersion: Option[Long] = if(hasCommitted) Some(newVersion) else None
 
     private def getValue(key: UnsafeRow): UnsafeRow = {
-      val valueBytes = store.get(key.getBytes)
+      val valueBytes = currentDb.get(key.getBytes)
       if (valueBytes == null) return null
       val value = new UnsafeRow(valueSchema.fields.length)
       value.pointTo(valueBytes, valueBytes.length)
@@ -328,6 +341,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
   @volatile private var rotatingBackupKey: Boolean = _
+  @volatile private var closeDbOnCommit: Boolean = _
   private var remoteBackupPath: Path = _
   private var localBackupPath: Path = _
   private var localBackupFs: FileSystem = _
@@ -369,6 +383,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.ttlSec = setTTL(storeConf.confs)
     this.isStrictExpire = setExpireMode(storeConf.confs)
     this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
+    this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
 
     // initialize paths
     remoteBackupPath = stateStoreId.storeCheckpointLocation()
@@ -393,7 +408,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       .setCompactionStyle(CompactionStyle.UNIVERSAL)
     writeOptions = new WriteOptions()
       .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
-    currentDb = openDb
 
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
@@ -430,7 +444,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"initializing state backup at $remoteBackupPath for $this")
       remoteBackupFm.mkdirs( new Path(remoteBackupPath, "shared"))
       backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
-      createBackup(0L)
+      synchronized {
+        currentDb = openDb
+        createBackup(0L)
+        currentDb.close()
+        currentDb = null
+      }
     }
     logInfo(s"initialized $this")
   } catch {
@@ -452,9 +471,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   def getStore(version: Long, cache: MapType): StateStore = synchronized {
     require(version >= 0, "Version cannot be less than 0")
     if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
-    restoreDb(version)
-    currentStore = new RocksDbStateStore(version, keySchema, valueSchema, currentDb, cache)
-    logInfo(s"Retrieved $currentStore for $this version $version")
+    val t = measureTime {
+      restoreDb(version)
+      currentStore = new RocksDbStateStore(version, keySchema, valueSchema, cache)
+    }
+    logInfo(s"Retrieved $currentStore for $this version $version, took $t seconds")
     // return
     currentStore
   }
@@ -463,6 +484,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // check if current db is desired version, else search in backups and restore
     if (currentStore!=null && currentStore.getCommittedVersion.contains(version)) {
+      if (currentDb==null) synchronized {
+        currentDb = openDb
+      }
       logDebug(s"Current db already has correct version $version. No restore required for $this.")
     } else {
 
@@ -472,10 +496,15 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // close db and restore backup
       val tRestore = measureTime {
-        currentDb.close() // we need to close before restore
-        val restoreOptions = new RestoreOptions(false)
-        backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
-        currentDb = openDb
+        synchronized {
+          if (currentDb != null) {
+            currentDb.close() // we need to close before restore
+            currentDb = null
+          }
+          val restoreOptions = new RestoreOptions(false)
+          backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
+          currentDb = openDb
+        }
       }
       logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
 
@@ -506,11 +535,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val t = measureTime {
 
       // flush WAL to SST Files and do manual compaction
-      currentDb.synchronized {
+      synchronized {
+        val opened = if (currentDb==null) {
+          currentDb = openDb
+          true
+        } else false
         currentDb.flush(new FlushOptions().setWaitForFlush(true))
         currentDb.pauseBackgroundWork()
         currentDb.compactRange()
         currentDb.continueBackgroundWork()
+        if (opened) {
+          currentDb.close()
+          currentDb = null
+        }
       }
 
       // estimate db size
@@ -579,9 +616,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // create local backup
     val tBackup = measureTime {
       // Don't flush before backup, as also WAL is backuped. We can use WAL for efficient incremental backup
-      currentDb.synchronized {
-        backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false) // create backup for version 0
-      }
+      backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false) // create backup for version 0
     }
     val backupId = backupEngine.getBackupInfo.asScala.map(_.backupId()).max
     logDebug(s"created backup for $this version $version with backupId $backupId, took $tBackup secs")
@@ -872,6 +907,10 @@ object RocksDbStateStoreProvider {
 
   final val DEFAULT_STATE_COMPRESSION_TYPE: String = null // NO_COMPRESSION
 
+  final val STATE_CLOSE_DB_AFTER_COMMIT: String = "spark.sql.streaming.stateStore.closeDbAfterCommit"
+
+  final val DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT: String = "true"
+
   final val DUMMY_VALUE: String = ""
 
   private def createCache(stateTtlSecs: Long): MapType = {
@@ -929,6 +968,12 @@ object RocksDbStateStoreProvider {
 
   private def setCompressionType(conf: Map[String, String]): CompressionType =
     Try(CompressionType.getCompressionType(conf.getOrElse(STATE_COMPRESSION_TYPE, DEFAULT_STATE_COMPRESSION_TYPE))) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setCloseDbAfterCommit(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(STATE_CLOSE_DB_AFTER_COMMIT, DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT).toBoolean) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
