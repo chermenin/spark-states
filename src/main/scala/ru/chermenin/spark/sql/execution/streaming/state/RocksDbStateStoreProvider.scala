@@ -217,8 +217,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           if (isStrictExpire) keyCache.size
           else currentDb.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
 
+        createBackup(newVersion)
         if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
-          createBackup(newVersion)
           currentDb.close
           currentDb = null
         }
@@ -531,6 +531,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * Do maintenance backing data files, including cleaning up old files
     */
   override def doMaintenance(): Unit = try {
+    logDebug(s"starting doMaintenance for $this")
+
     var sharedFilesSize: Long = 0
     val t = measureTime {
 
@@ -566,6 +568,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       removedBackups.foreach(backupList.remove)
       syncRemoteIndex()
       logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+
+      // check free diskspace
+      //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
+      //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
 
       // log statistics
       val statsTypes = Seq(
