@@ -16,11 +16,9 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.{File, FileInputStream, FileOutputStream, IOException}
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{Path => LocalPath, _}
+import java.io.File
 import java.util.concurrent.TimeUnit
-import java.util.zip.{ZipEntry, ZipInputStream, ZipOutputStream}
+import java.util.zip.ZipInputStream
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.hadoop.conf.Configuration
@@ -401,7 +399,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       .setCreateIfMissing(true)
       .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
       .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
+      // .setDbWriteBufferSize() // this is the same as setWriteBufferSize*setMaxWriteBufferNumber
+      .setAllowMmapReads(false) // could be responsible for memory leaks according to https://github.com/facebook/rocksdb/issues/3216
+      .setAllowMmapWrites(false) // this could make memory leaks according to https://github.com/facebook/rocksdb/issues/3216
       //.setTargetFileSizeBase(xxx * SizeUnit.MB))
+      .setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(false).setBlockCacheSize(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB))
       .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
       .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
       .setCompressionType(setCompressionType(storeConf.confs))
@@ -785,15 +787,21 @@ object RocksDbStateStoreProvider {
   /** Default write buffer size for RocksDb in megabytes */
   final val WRITE_BUFFER_SIZE_MB: String = "spark.sql.streaming.stateStore.writeBufferSizeMb"
 
-  val DEFAULT_WRITE_BUFFER_SIZE_MB = 200
+  val DEFAULT_WRITE_BUFFER_SIZE_MB = 64
 
   /** Default number of write buffers for RocksDb */
   val DEFAULT_WRITE_BUFFER_NUMBER = 3
 
-  /** Default background compactions value for RocksDb */
-  val DEFAULT_BACKGROUND_COMPACTIONS = 10
+  /** Default block cache size for RocksDb in megabytes */
+  final val BLOCK_CACHE_SIZE_MB: String = "spark.sql.streaming.stateStore.blockCacheSizeMb"
 
+  val DEFAULT_BLOCK_CACHE_SIZE_MB = 128
+
+  /** statistics */
   val ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY = "rocksdb.estimate-num-keys"
+  val ROCKSDB_ESTIMATE_TABLE_READERS_MEM = "rocksdb.estimate-table-readers-mem"
+  val ROCKSDB_SIZE_ALL_MEM_TABLES = "rocksdb.size-all-mem-tables"
+  val ROCKSDB_CUR_SIZE_ALL_MEM_TABLES = "rocksdb.cur-size-all-mem-tables"
 
   final val STATE_EXPIRY_SECS: String = "spark.sql.streaming.stateStore.stateExpirySecs"
 
@@ -844,6 +852,12 @@ object RocksDbStateStoreProvider {
 
   private def setWriteBufferSizeMb(conf: Map[String, String]): Int =
     Try(conf.getOrElse(WRITE_BUFFER_SIZE_MB, DEFAULT_WRITE_BUFFER_SIZE_MB.toString).toInt) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setBlockCacheSizeMb(conf: Map[String, String]): Int =
+    Try(conf.getOrElse(BLOCK_CACHE_SIZE_MB, DEFAULT_BLOCK_CACHE_SIZE_MB.toString).toInt) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
