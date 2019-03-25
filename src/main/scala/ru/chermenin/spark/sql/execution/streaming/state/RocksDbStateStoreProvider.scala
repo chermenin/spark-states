@@ -115,7 +115,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val Updating, Committed, Aborted = Value
     }
 
-    private var rocksdbVolumeStatistics: Map[String,Long] = Map()
+    @volatile private var rocksdbVolumeStatistics: Map[String,Long] = Map()
     @volatile private var state: State.Value = State.Updating
 
     /** Unique identifier of the store */
@@ -411,6 +411,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       .setStatistics(currentDbStats)
       .setCreateIfMissing(true)
       .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
+      .setMaxWriteBufferNumber( setWriteBufferNumber(storeConf.confs))
       .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
       // .setDbWriteBufferSize() // this is the same as setWriteBufferSize*setMaxWriteBufferNumber
       .setAllowMmapReads(false) // could be responsible for memory leaks according to https://github.com/facebook/rocksdb/issues/3216
@@ -793,8 +794,11 @@ object RocksDbStateStoreProvider {
 
   val DEFAULT_WRITE_BUFFER_SIZE_MB = 64
 
-  /** Default number of write buffers for RocksDb */
-  val DEFAULT_WRITE_BUFFER_NUMBER = 3
+  /** Default write buffer number for RocksDb: as we normally close Rocksdb after each commit (see also closeDbAfterCommit),
+    * multiple write buffers don't make sense as each key of the spark partition is read/written at most once */
+  final val WRITE_BUFFER_NUMBER: String = "spark.sql.streaming.stateStore.writeBufferSizeMb"
+
+  val DEFAULT_WRITE_BUFFER_NUMBER = 1
 
   /** Default block cache size for RocksDb in megabytes */
   final val BLOCK_CACHE_SIZE_MB: String = "spark.sql.streaming.stateStore.blockCacheSizeMb"
@@ -857,6 +861,12 @@ object RocksDbStateStoreProvider {
 
   private def setWriteBufferSizeMb(conf: Map[String, String]): Int =
     Try(conf.getOrElse(WRITE_BUFFER_SIZE_MB, DEFAULT_WRITE_BUFFER_SIZE_MB.toString).toInt) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setWriteBufferNumber(conf: Map[String, String]): Int =
+    Try(conf.getOrElse(WRITE_BUFFER_NUMBER, DEFAULT_WRITE_BUFFER_NUMBER.toString).toInt) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
