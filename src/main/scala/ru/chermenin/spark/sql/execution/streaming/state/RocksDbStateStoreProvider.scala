@@ -115,7 +115,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val Updating, Committed, Aborted = Value
     }
 
-    @volatile private var keysNumber: Long = 0
+    private var rocksdbVolumeStatistics: Map[String,Long] = Map()
     @volatile private var state: State.Value = State.Updating
 
     /** Unique identifier of the store */
@@ -209,26 +209,42 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def commit(): Long = try {
       verify(state == State.Updating, "Cannot commit already committed or aborted state")
 
+      updateStatistics()
+
       state = State.Committed
       synchronized {
-        keysNumber =
-          if (isStrictExpire) keyCache.size
-          else currentDb.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
-
         createBackup(newVersion)
         if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
-          currentDb.close
+          currentDb.close()
           currentDb = null
         }
       }
 
-      logInfo(s"Committed version $newVersion for $this, store has ~$keysNumber keys")
+      logInfo(s"Committed version $newVersion for $this")
       newVersion
 
     } catch {
       case e:Exception =>
         logError(s"Error '${e.getMessage}' in method 'commit' for version $newVersion of $this")
         throw e
+    }
+
+    def updateStatistics(): Unit = {
+      // log statistics
+      val statsTypes = Seq(
+          TickerType.NUMBER_KEYS_READ, TickerType.NUMBER_KEYS_UPDATED, TickerType.NUMBER_KEYS_WRITTEN
+        , TickerType.MEMTABLE_HIT, TickerType.MEMTABLE_MISS
+        , TickerType.BLOCK_CACHE_HIT, TickerType.BLOCK_CACHE_MISS
+        , TickerType.BYTES_READ, TickerType.BYTES_WRITTEN
+      )
+      logInfo(s"rocksdb cache statistics for $this: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
+
+      //log volume statistics
+      rocksdbVolumeStatistics = ROCKSDB_VOLUME_PROPERTIES.map{ p =>
+        if (p==ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY && isStrictExpire) p->keyCache.size
+        else p->currentDb.getLongProperty(p)
+      }.toMap
+      logInfo(s"rocksdb volume statistics for $this: "+rocksdbVolumeStatistics.map{ case (k,v) => s"$k=$v"}.mkString(" "))
     }
 
     /**
@@ -238,16 +254,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       verify(state != State.Committed, "Cannot abort already committed state")
       //TODO: how can we rollback uncommitted changes -> we should use a transaction!
 
-      state = State.Aborted
-      synchronized {
-        keysNumber =
-          if (isStrictExpire) keyCache.size
-          else currentDb.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+      updateStatistics()
 
-        if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
-          currentDb.close()
-          currentDb = null
-        }
+      state = State.Aborted
+      if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
+        currentDb.close()
+        currentDb = null
       }
 
       logInfo(s"Aborted version $newVersion for $this")
@@ -304,7 +316,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Returns current metrics of the state store
       */
     override def metrics: StateStoreMetrics =
-      StateStoreMetrics(keysNumber, keysNumber * (keySchema.defaultSize + valueSchema.defaultSize), Map.empty)
+      StateStoreMetrics( rocksdbVolumeStatistics.getOrElse(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY,0)
+                       , rocksdbVolumeStatistics.getOrElse(ROCKSDB_SIZE_ALL_MEM_TABLES,0), Map.empty)
 
     /**
       * Whether all updates have been committed
@@ -574,15 +587,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       // check free diskspace
       //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
       //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
-
-      // log statistics
-      val statsTypes = Seq(
-          TickerType.NUMBER_KEYS_READ, TickerType.NUMBER_KEYS_UPDATED, TickerType.NUMBER_KEYS_WRITTEN
-        , TickerType.MEMTABLE_HIT, TickerType.MEMTABLE_MISS
-        , TickerType.BLOCK_CACHE_HIT, TickerType.BLOCK_CACHE_MISS
-        , TickerType.BYTES_READ, TickerType.BYTES_WRITTEN
-      )
-      logInfo(s"rocksdb statistics for $this: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
     }
     logInfo(s"doMaintenance for $this took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
   } catch {
@@ -802,6 +806,7 @@ object RocksDbStateStoreProvider {
   val ROCKSDB_ESTIMATE_TABLE_READERS_MEM = "rocksdb.estimate-table-readers-mem"
   val ROCKSDB_SIZE_ALL_MEM_TABLES = "rocksdb.size-all-mem-tables"
   val ROCKSDB_CUR_SIZE_ALL_MEM_TABLES = "rocksdb.cur-size-all-mem-tables"
+  val ROCKSDB_VOLUME_PROPERTIES = Seq(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY,ROCKSDB_ESTIMATE_TABLE_READERS_MEM,ROCKSDB_SIZE_ALL_MEM_TABLES,ROCKSDB_CUR_SIZE_ALL_MEM_TABLES)
 
   final val STATE_EXPIRY_SECS: String = "spark.sql.streaming.stateStore.stateExpirySecs"
 
