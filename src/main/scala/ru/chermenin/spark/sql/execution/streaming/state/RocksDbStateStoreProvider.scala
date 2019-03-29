@@ -490,7 +490,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     getStore(version, createCache(ttlSec))
   } catch {
     case e:Exception =>
-      logError(s"Error '${e.getMessage}' in method 'getStore' of $this")
+      logError(s"Error '${e.getMessage}' in method 'getStore' of $this for version $version")
       throw e
   }
   def getStore(version: Long, cache: MapType): StateStore = synchronized {
@@ -539,7 +539,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val tCleanup = MiscHelper.measureTime {
         remoteCleanupList.clear
         newerBackups.foreach{ case (v,(b,k)) =>
-          backupEngine.deleteBackup(b)
+          Try(backupEngine.deleteBackup(b))
           backupList.remove(v)
           remoteCleanupList += new Path(remoteBackupPath,s"${getBackupKey(v)}.zip")
         }
