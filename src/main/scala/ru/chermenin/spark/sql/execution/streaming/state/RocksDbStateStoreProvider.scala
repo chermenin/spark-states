@@ -611,6 +611,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * Called when the provider instance is unloaded from the executor.
     */
   override def close(): Unit = try {
+    // cleanup
+    if(currentDb!=null) {
+      currentDb.close
+      currentDb = null
+    }
     MiscHelper.deleteFile(localDataDir)
     logInfo(s"Removed local db and backup dir of $this")
   } catch {
