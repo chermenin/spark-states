@@ -362,7 +362,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private val currentDbStats: Statistics = new Statistics()
   private var currentStore: RocksDbStateStore = _
   private var backupEngine: BackupEngine = _
-  private var backupList: mutable.HashMap[Long,(Int,String)] = mutable.HashMap()
+  private var backupList: mutable.Map[Long,(Int,String)] = mutable.HashMap()
+  private var remoteCleanupList: mutable.ArrayBuffer[Path] = mutable.ArrayBuffer()
   private var remoteBackupFm: CheckpointFileManager = _
 
   /**
@@ -527,16 +528,26 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
       val newerBackups = backupList.filter{ case (v,(b,k)) => v > version}
       val tCleanup = MiscHelper.measureTime {
+        remoteCleanupList.clear
         newerBackups.foreach{ case (v,(b,k)) =>
           backupEngine.deleteBackup(b)
           backupList.remove(v)
+          remoteCleanupList += new Path(remoteBackupPath,s"${getBackupKey(v)}.zip")
         }
+
+        // delete unused shared data files to avoid later conflicts
+        val (_,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
+        if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unsed remote files to delete for $this")
+        remoteCleanupList ++= sharedFiles2Del
       }
-      if (newerBackups.nonEmpty) logDebug(s"deleted newer backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
+      if (newerBackups.nonEmpty) logInfo(s"deleted newer backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
     }
   }
 
-  private def openDb: TtlDB = TtlDB.open(options, localDbDir, ttlSec, false)
+  private def openDb: RocksDB = {
+    if (ttlSec>=0) TtlDB.open(options, localDbDir, ttlSec, false)
+    else RocksDB.open(options, localDbDir)
+  }
 
   /**
     * Return the id of the StateStores this provider will generate.
@@ -641,18 +652,23 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def syncRemoteBackup(backupId: Int, version: Long): String = {
 
+    // process remoteCleanupList before syncing new files
+    remoteCleanupList.par.foreach( f =>
+      remoteBackupFm.delete(f)
+    )
+    remoteCleanupList.clear
+
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
     logDebug(s"found ${sharedFiles2Copy.size} files to copy to remote filesystem and ${sharedFiles2Del.size} files to delete for $this")
 
     // copy new data files in parallel
     sharedFiles2Copy.par.foreach( f =>
-      copyLocalToRemoteFile(f, new Path(remoteBackupPath,s"shared/${f.getName}"), false)
+      copyLocalToRemoteFile(f, new Path(remoteBackupPath,s"shared/${f.getName}"), true)
     )
 
     // save metadata & private files as zip archive
-    val backupKey = if (rotatingBackupKey) MiscHelper.nbToChar((version % storeConf.minVersionsToRetain).toInt)
-      else version.toString
+    val backupKey = getBackupKey(version)
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
     MiscHelper.compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"), remoteBackupFm, getHadoopFileBufferSize, Some(localBackupDir))
@@ -671,6 +687,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     //return
     backupKey
   }
+
+  private def getBackupKey(version: Long) = {
+    if (rotatingBackupKey) MiscHelper.nbToChar((version % storeConf.minVersionsToRetain).toInt)
+    else version.toString
+  }
+
 
   /**
     * update index on remote filesystem
@@ -698,7 +720,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
         case None => Some(lf) // not existing -> copy
         case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> copy
-          if (errorOnChange) logError(s"Remote file $rf is different from local file $lf. Overwriting for now.")
+          if (errorOnChange) logError(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
           Some(lf)
         case _ => None // existing and the same -> nothing
       }
