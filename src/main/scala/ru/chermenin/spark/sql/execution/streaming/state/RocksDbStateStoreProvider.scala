@@ -16,7 +16,7 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.File
+import java.io.{File, FileNotFoundException}
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 
@@ -429,6 +429,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
+      .setShareTableFiles(true)
+      .setShareFilesWithChecksum(false)
+      .setSync(true)
     backupList.clear
     if (remoteBackupFm.exists(remoteBackupPath)) {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
@@ -453,7 +456,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // copy metadata/private files according to backupList in parallel
         backupList.values.map{ case (backupId,backupKey) => s"$backupKey.zip" }.par
-          .foreach(filename => MiscHelper.decompressFromRemote( new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize))
+          .foreach(filename => try {
+            MiscHelper.decompressFromRemote( new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
+          } catch {
+            case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
+          })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
@@ -541,7 +548,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unsed remote files to delete for $this")
         remoteCleanupList ++= sharedFiles2Del
       }
-      if (newerBackups.nonEmpty) logInfo(s"deleted newer backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
+      if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
     }
   }
 
