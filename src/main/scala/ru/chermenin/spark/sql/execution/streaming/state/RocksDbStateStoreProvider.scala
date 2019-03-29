@@ -672,6 +672,18 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     )
     remoteCleanupList.clear
 
+    // make sure backup is existing, as i'm not sure if it runs in background...
+    if (!backupEngine.getBackupInfo.asScala.exists(_.backupId() == backupId)) {
+      val waitTimeMs = 50
+      val waitCntMax = 10
+      val waitCnt = (0 to waitCntMax).toStream.takeWhile { _ =>
+        Thread.sleep(waitTimeMs)
+        backupEngine.getBackupInfo.asScala.exists(_.backupId() == backupId)
+      }.last
+      if (waitCnt==waitCntMax) throw new IllegalStateException(s"waited too long for backupId $backupId of $version")
+      logInfo(s"waited ${waitTimeMs*waitCnt}ms for backupId $backupId of $version")
+    }
+
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
     logDebug(s"found ${sharedFiles2Copy.size} files to copy to remote filesystem and ${sharedFiles2Del.size} files to delete for $this")
