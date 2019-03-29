@@ -506,6 +506,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   }
 
   protected def restoreAndOpenDb(version: Long): Unit = {
+    logDebug(s"starting to restore db for $this version $version from local backup")
 
     // check if current db is desired version, else search in backups and restore
     if (currentStore!=null && currentStore.getCommittedVersion.contains(version)) {
