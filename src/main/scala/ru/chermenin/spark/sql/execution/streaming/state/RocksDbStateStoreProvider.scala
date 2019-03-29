@@ -594,6 +594,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // cleanup old backups
       backupEngine.purgeOldBackups(storeConf.minVersionsToRetain)
+      backupEngine.garbageCollect()
 
       // remove cleaned up backups from remote filesystem and backup list
       val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
