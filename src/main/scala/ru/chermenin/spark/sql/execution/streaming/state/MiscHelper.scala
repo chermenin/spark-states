@@ -76,24 +76,6 @@ object MiscHelper {
   }
 
   /**
-    * Method to delete directory or file.
-    */
-  def deleteFile(path: String): Unit = {
-    Files.walkFileTree(Paths.get(path), new SimpleFileVisitor[LocalPath] {
-
-      override def visitFile(visitedFile: LocalPath, attrs: BasicFileAttributes): FileVisitResult = {
-        Files.delete(visitedFile)
-        FileVisitResult.CONTINUE
-      }
-
-      override def postVisitDirectory(visitedDirectory: LocalPath, exc: IOException): FileVisitResult = {
-        Files.delete(visitedDirectory)
-        FileVisitResult.CONTINUE
-      }
-    })
-  }
-
-  /**
     * maps number to string composed of A-Z
     */
   def nbToChar(nb: Int) = {

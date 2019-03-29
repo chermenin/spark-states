@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
+import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
 import org.apache.spark.internal.Logging
@@ -616,7 +617,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       currentDb.close
       currentDb = null
     }
-    MiscHelper.deleteFile(localDataDir)
+    FileUtils.deleteDirectory(new File(localDataDir))
     logInfo(s"Removed local db and backup dir of $this")
   } catch {
     case e:Exception =>
@@ -945,4 +946,5 @@ object RocksDbStateStoreProvider {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
+
 }
