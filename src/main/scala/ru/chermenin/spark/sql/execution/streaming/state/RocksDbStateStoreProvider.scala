@@ -441,7 +441,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         val backupListInput = remoteBackupFm.open(new Path(remoteBackupPath, "index"))
         val backupListParsed = Source.fromInputStream(backupListInput).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
         backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-        logDebug(s"index contains the following backups for $this: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+        logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map( b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
       }.getOrElse {
         backupList ++= getBackupListFromRemoteFiles
         logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
@@ -462,8 +462,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
-        backupEngine.purgeOldBackups(storeConf.maxVersionsToRetainInMemory)
-        backupEngine.garbageCollect()
+        cleanupOldBackups
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
 
@@ -596,8 +595,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .map(_.getLen).sum
 
       // cleanup old backups
-      backupEngine.purgeOldBackups(storeConf.minVersionsToRetain)
-      backupEngine.garbageCollect()
+      cleanupOldBackups()
 
       // remove cleaned up backups from remote filesystem and backup list
       val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
@@ -709,11 +707,26 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     backupKey
   }
 
+  /**
+    * get backup key for version
+    * if rotatingBackupKey is set, this is a rotating key with minVersionsToRetain possible values
+    * otherwise it's the version
+    */
   private def getBackupKey(version: Long) = {
     if (rotatingBackupKey) MiscHelper.nbToChar((version % storeConf.minVersionsToRetain).toInt)
     else version.toString
   }
 
+  /**
+    * keep latest x backup versions, where x can be configured by minVersionsToRetain
+    */
+  private def cleanupOldBackups(): Unit = {
+    val backupsSorted = backupEngine.getBackupInfo.asScala.toSeq.sortBy(_.appMetadata().toLong)
+    val backupsToDelete = backupsSorted.take(backupsSorted.size-storeConf.minVersionsToRetain)
+    backupsToDelete.foreach( b => backupEngine.deleteBackup(b.backupId()))
+    backupEngine.garbageCollect()
+    logDebug( s"backup engine contains the following backups for $this: " + backupEngine.getBackupInfo.asScala.map(b => s"v=${b.appMetadata()},b=${b.backupId}".mkString("; ")))
+  }
 
   /**
     * update index on remote filesystem
