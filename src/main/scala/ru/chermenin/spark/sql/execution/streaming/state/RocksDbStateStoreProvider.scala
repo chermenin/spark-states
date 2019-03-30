@@ -93,6 +93,7 @@ import scala.util.{Failure, Random, Success, Try}
   * This is an old bug which might be solved in Java 10 or 11, see https://bugs.java.com/bugdatabase/view_bug.do?bug_id=4715154
   *
   *  TODO: What happens when backupId overflows (backupId is an integer, but version is long)
+  *  TODO: Enable checksum in BackupOptions again?
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
@@ -611,7 +612,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
       //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
     }
-    logInfo(s"doMaintenance for $this took $t secs, shared file size is ${math.round(sharedFilesSize.toFloat/1024).toFloat/1024} MB")
+    logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(sharedFilesSize)}")
   } catch {
     case e:Exception =>
       logError(s"Error '${e.getMessage}' in method 'doMaintenance' of $this")
@@ -725,7 +726,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val backupsToDelete = backupsSorted.take(backupsSorted.size-storeConf.minVersionsToRetain)
     backupsToDelete.foreach( b => backupEngine.deleteBackup(b.backupId()))
     backupEngine.garbageCollect()
-    logDebug( s"backup engine contains the following backups for $this: " + backupEngine.getBackupInfo.asScala.map(b => s"v=${b.appMetadata()},b=${b.backupId}".mkString("; ")))
+    logDebug( s"backup engine contains the following backups for $this: " + backupEngine.getBackupInfo.asScala.map(b => s"v=${b.appMetadata()},b=${b.backupId}").mkString("; "))
   }
 
   /**

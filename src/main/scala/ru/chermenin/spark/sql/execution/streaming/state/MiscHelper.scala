@@ -17,6 +17,11 @@ object MiscHelper {
     (System.currentTimeMillis()-t0).toFloat / 1000
   }
 
+  def formatBytes(bytes:Long): String = {
+    val megaBytes = BigDecimal(bytes.toFloat / 1024 / 1024).setScale(2, BigDecimal.RoundingMode.HALF_UP).toDouble
+    s"${megaBytes}MB"
+  }
+
   /**
     * Save files as ZIP archive in HDFS.
     */
