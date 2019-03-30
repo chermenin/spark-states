@@ -23,7 +23,7 @@ import java.util.zip.ZipInputStream
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
+import org.apache.hadoop.fs.{FSDataInputStream, FileSystem, Path, PathFilter}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
@@ -438,12 +438,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
       // read index file into backupList, otherwise extract backup information from archive files
-      Try {
-        val backupListInput = remoteBackupFm.open(new Path(remoteBackupPath, "index"))
-        val backupListParsed = Source.fromInputStream(backupListInput).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
+      val backupListInputStream = Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))).toOption
+      if (backupListInputStream.isDefined) {
+        val backupListParsed = try {
+          Source.fromInputStream(backupListInputStream.get).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
+        } finally {
+          backupListInputStream.get.close()
+        }
         backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
         logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map( b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
-      }.getOrElse {
+      } else {
         backupList ++= getBackupListFromRemoteFiles
         logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
       }
