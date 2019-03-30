@@ -462,6 +462,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
+        backupEngine.purgeOldBackups(storeConf.maxVersionsToRetainInMemory)
+        backupEngine.garbageCollect()
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
 
@@ -543,6 +545,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           backupList.remove(v)
           remoteCleanupList += new Path(remoteBackupPath,s"${getBackupKey(v)}.zip")
         }
+        backupEngine.garbageCollect()
 
         // delete unused shared data files to avoid later conflicts
         val (_,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
@@ -649,7 +652,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // create local backup
     val tBackup = MiscHelper.measureTime {
       // Don't flush before backup, as also WAL is backuped. We can use WAL for efficient incremental backup
-      backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false) // create backup for version 0
+      backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false)
     }
     val backupId = backupEngine.getBackupInfo.asScala.map(_.backupId()).max
     logDebug(s"created backup for $this version $version with backupId $backupId, took $tBackup secs")
@@ -673,17 +676,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     )
     remoteCleanupList.clear
 
-    // make sure backup is existing, as i'm not sure if it runs in background...
-    if (!backupEngine.getBackupInfo.asScala.exists(_.backupId() == backupId)) {
-      val waitTimeMs = 50
-      val waitCntMax = 10
-      val waitCnt = (0 to waitCntMax).toStream.takeWhile { _ =>
-        Thread.sleep(waitTimeMs)
-        backupEngine.getBackupInfo.asScala.exists(_.backupId() == backupId)
-      }.last
-      if (waitCnt==waitCntMax) throw new IllegalStateException(s"waited too long for backupId $backupId of $version")
-      logInfo(s"waited ${waitTimeMs*waitCnt}ms for backupId $backupId of $version")
-    }
+    // make sure backup is existing
+    assert(backupEngine.getBackupInfo.asScala.exists(_.backupId() == backupId), s"backupId $backupId for $version not found")
 
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
