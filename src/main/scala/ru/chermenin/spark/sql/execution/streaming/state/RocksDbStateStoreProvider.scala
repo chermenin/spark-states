@@ -16,7 +16,7 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.{File, FileNotFoundException}
+import java.io.{BufferedReader, File, FileNotFoundException, InputStreamReader}
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 
@@ -438,18 +438,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
       // read index file into backupList, otherwise extract backup information from archive files
-      val backupListInputStream = Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))).toOption
-      if (backupListInputStream.isDefined) {
-        val backupListParsed = try {
-          Source.fromInputStream(backupListInputStream.get).getLines().map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
-        } finally {
-          backupListInputStream.get.close()
-        }
-        backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-        logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map( b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
-      } else {
-        backupList ++= getBackupListFromRemoteFiles
-        logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+      Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
+        case Success(backupListInputStream) =>
+          val backupListReader = new BufferedReader(new InputStreamReader(backupListInputStream))
+          val backupListParsed = backupListReader.lines.iterator.asScala.toArray.map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
+          backupListInputStream.close() // it is tricky that input stream isn't closed at all or even twice... iterator.toArray / manual close seems to be proper
+          backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
+          logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map( b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
+        case Failure(_:FileNotFoundException) =>
+          backupList ++= getBackupListFromRemoteFiles
+          logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
       }
 
       // load files
