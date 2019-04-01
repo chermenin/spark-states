@@ -558,10 +558,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
   }
 
-  private def openDb: RocksDB = {
-    if (ttlSec>=0) TtlDB.open(options, localDbDir, ttlSec, false)
-    else RocksDB.open(options, localDbDir)
-  }
+  private def openDb: RocksDB = TtlDB.open(options, localDbDir, ttlSec, false)
+
 
   /**
     * Return the id of the StateStores this provider will generate.
