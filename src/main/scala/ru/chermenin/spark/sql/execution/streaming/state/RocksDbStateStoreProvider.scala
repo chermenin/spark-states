@@ -35,7 +35,6 @@ import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvide
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.io.Source
 import scala.util.{Failure, Random, Success, Try}
 
 /**
@@ -428,6 +427,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     writeOptions = new WriteOptions()
       .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
 
+    restoreFromRemoteBackups()
+
+    logInfo(s"initialized $this")
+  } catch {
+    case e:Exception =>
+      logError(s"Error '${e.getMessage}' in method 'init' of $this")
+      throw e
+  }
+
+  def restoreFromRemoteBackups(): Unit = {
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
       .setShareTableFiles(true)
@@ -448,6 +457,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         case Failure(_:FileNotFoundException) =>
           backupList ++= getBackupListFromRemoteFiles
           logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+        case Failure(e) => throw e
       }
 
       // load files
@@ -465,7 +475,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
-        cleanupOldBackups
+        cleanupOldBackups()
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
 
@@ -480,11 +490,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         currentDb = null
       }
     }
-    logInfo(s"initialized $this")
-  } catch {
-    case e:Exception =>
-      logError(s"Error '${e.getMessage}' in method 'init' of $this")
-      throw e
   }
 
   /**
@@ -499,7 +504,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   }
   def getStore(version: Long, cache: MapType): StateStore = synchronized {
     require(version >= 0, "Version cannot be less than 0")
-    if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
+
+    // try restoring remote backups if version doesnt exists in local backups. This might happen if execution of a partition changes executor.
+    if (!backupList.contains(version)) {
+      restoreFromRemoteBackups()
+      if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
+    }
     val t = MiscHelper.measureTime {
       restoreAndOpenDb(version)
       currentStore = new RocksDbStateStore(version, keySchema, valueSchema, cache)
