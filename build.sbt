@@ -17,7 +17,7 @@
 organization := "ru.chermenin"
 name := "spark-states"
 
-version := "0.6"
+version := "0.7"
 
 crossScalaVersions := Seq("2.11.12", "2.12.7")
 
@@ -29,7 +29,6 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
   "org.apache.spark" %% "spark-streaming" % sparkVersion % "provided",
   "org.rocksdb" % "rocksdbjni" % "5.17.2",
-
 
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
