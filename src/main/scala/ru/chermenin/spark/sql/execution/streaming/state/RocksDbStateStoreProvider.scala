@@ -142,7 +142,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       returnValue
     } catch {
       case e:Exception =>
-        logError(s"Error '${e.getMessage}' in method 'get' key ${key.toSeq(keySchema)} of $this")
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'get' key ${key.toSeq(keySchema)} of $this")
         throw e
     }
 
@@ -165,7 +165,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logInfo(s"put ${key.toSeq(keySchema)} took $t secs, size is ${value.getSizeInBytes}")
     } catch {
       case e:Exception =>
-        logError(s"Error '${e.getMessage}' in method 'put' key ${key.toSeq(keySchema)} of $this")
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'put' key ${key.toSeq(keySchema)} of $this")
         throw e
     }
 
@@ -182,7 +182,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       }
     } catch {
       case e:Exception =>
-        logError(s"Error '${e.getMessage}' in method 'remove' of $this")
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'remove' of $this")
         throw e
     }
 
@@ -226,7 +226,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     } catch {
       case e:Exception =>
-        logError(s"Error '${e.getMessage}' in method 'commit' for version $newVersion of $this")
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'commit' for version $newVersion of $this")
         throw e
     }
 
@@ -432,7 +432,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logInfo(s"initialized $this")
   } catch {
     case e:Exception =>
-      logError(s"Error '${e.getMessage}' in method 'init' of $this")
+      logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'init' of $this")
       throw e
   }
 
@@ -499,7 +499,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     getStore(version, createCache(ttlSec))
   } catch {
     case e:Exception =>
-      logError(s"Error '${e.getMessage}' in method 'getStore' of $this for version $version")
+      logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'getStore' of $this for version $version")
       throw e
   }
   def getStore(version: Long, cache: MapType): StateStore = synchronized {
@@ -625,7 +625,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(sharedFilesSize)}")
   } catch {
     case e:Exception =>
-      logError(s"Error '${e.getMessage}' in method 'doMaintenance' of $this")
+      logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'doMaintenance' of $this")
       throw e
   }
 
@@ -642,8 +642,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logInfo(s"Removed local db and backup dir of $this")
   } catch {
     case e:Exception =>
-      logError(s"Error '${e.getMessage}' in method 'close' of $this")
-      throw e
+      logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'close' of $this")
   }
 
   /**
