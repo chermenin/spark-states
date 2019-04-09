@@ -80,6 +80,23 @@ object MiscHelper {
     }
   }
 
+
+  /**
+    * Create local data directory.
+    */
+  def createLocalDir(path: String): String = {
+    val file = new File(path)
+    file.delete()
+    file.mkdirs()
+    file.getAbsolutePath.replace('\\','/')
+  }
+
+  /**
+    * Verify the condition and rise an exception if the condition is failed.
+    */
+  def verify(condition: => Boolean, msg: String): Unit =
+    if (!condition) throw new IllegalStateException(msg)
+
   /**
     * maps number to string composed of A-Z
     */

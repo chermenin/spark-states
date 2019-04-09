@@ -151,7 +151,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * the params can be reused, and must make copies of the data as needed for persistence.
       */
     override def put(key: UnsafeRow, value: UnsafeRow): Unit = try {
-      verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
+      MiscHelper.verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
       val t = MiscHelper.measureTime {
         val keyCopy = key.copy()
         val valueCopy = value.copy()
@@ -173,7 +173,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Remove a single non-null key.
       */
     override def remove(key: UnsafeRow): Unit = try {
-      verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
+      MiscHelper.verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
       RocksDbStateStoreProvider.this.synchronized {
         currentDb.delete(key.getBytes)
 
@@ -200,7 +200,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       *         end, both inclusive.
       */
     override def getRange(start: Option[UnsafeRow], end: Option[UnsafeRow]): Iterator[UnsafeRowPair] = {
-      verify(state == State.Updating, "Cannot getRange from already committed or aborted state")
+      MiscHelper.verify(state == State.Updating, "Cannot getRange from already committed or aborted state")
       iterator()
     }
 
@@ -208,7 +208,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Commit all the updates that have been made to the store, and return the new version.
       */
     override def commit(): Long = try {
-      verify(state == State.Updating, "Cannot commit already committed or aborted state")
+      MiscHelper.verify(state == State.Updating, "Cannot commit already committed or aborted state")
 
       updateStatistics()
 
@@ -252,7 +252,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Abort all the updates made on this store. This store will not be usable any more.
       */
     override def abort(): Unit = try {
-      verify(state != State.Committed, "Cannot abort already committed state")
+      MiscHelper.verify(state != State.Committed, "Cannot abort already committed state")
       //TODO: how can we rollback uncommitted changes -> we should use a transaction!
 
       updateStatistics()
@@ -391,8 +391,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.valueSchema = valueSchema
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
-    this.localDataDir = createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
-    this.localWalDataDir = createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
+    this.localDataDir = MiscHelper.createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
+    this.localWalDataDir = MiscHelper.createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
     this.ttlSec = setTTL(storeConf.confs)
     this.isStrictExpire = setExpireMode(storeConf.confs)
     this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
@@ -400,10 +400,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // initialize paths
     remoteBackupPath = stateStoreId.storeCheckpointLocation()
-    localBackupDir = createLocalDir(localDataDir+"/backup")
+    localBackupDir = MiscHelper.createLocalDir(localDataDir+"/backup")
     localBackupPath = new Path("file:///"+localBackupDir)
     localBackupFs = localBackupPath.getFileSystem(hadoopConf)
-    localDbDir = createLocalDir(localDataDir+"/db")
+    localDbDir = MiscHelper.createLocalDir(localDataDir+"/db")
     remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
 
     // initialize empty database
@@ -822,22 +822,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // we need a random number to allow multiple streaming queries running with different state stores in the same spark job.
     s"spark-$sparkJobName-${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-${stateStoreId_.storeName}-${math.abs(Random.nextInt)}"
   }
-
-  /**
-    * Create local data directory.
-    */
-  private def createLocalDir(path: String): String = {
-    val file = new File(path)
-    file.delete()
-    file.mkdirs()
-    file.getAbsolutePath.replace('\\','/')
-  }
-
-  /**
-    * Verify the condition and rise an exception if the condition is failed.
-    */
-  private def verify(condition: => Boolean, msg: String): Unit =
-    if (!condition) throw new IllegalStateException(msg)
 
   /**
     * Get iterator of all the data of the latest version of the store.
