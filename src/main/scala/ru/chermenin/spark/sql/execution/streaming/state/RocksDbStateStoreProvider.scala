@@ -155,7 +155,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val t = MiscHelper.measureTime {
         val keyCopy = key.copy()
         val valueCopy = value.copy()
-        synchronized {
+        RocksDbStateStoreProvider.this.synchronized {
           currentDb.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
 
           if (isStrictExpire)
@@ -174,7 +174,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       */
     override def remove(key: UnsafeRow): Unit = try {
       verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
-      synchronized {
+      RocksDbStateStoreProvider.this.synchronized {
         currentDb.delete(key.getBytes)
 
         if (isStrictExpire)
@@ -213,9 +213,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       updateStatistics()
 
       state = State.Committed
-      synchronized {
+      RocksDbStateStoreProvider.this.synchronized {
         createBackup(newVersion)
-        if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
+        if (closeDbOnCommit) {
           currentDb.close()
           currentDb = null
         }
