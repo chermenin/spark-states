@@ -16,11 +16,7 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.File
-import java.util.zip.ZipInputStream
-
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
 import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper.{newDir, rowsToStringInt, stringToRow}
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId}
 import org.apache.spark.sql.internal.SQLConf

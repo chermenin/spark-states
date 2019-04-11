@@ -1,13 +1,14 @@
 package ru.chermenin.spark.sql.execution.streaming.state
 
 import java.io.{File, FileInputStream, FileOutputStream, IOException}
-import java.nio.file.{FileVisitResult, Files, Paths, SimpleFileVisitor}
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{Path => LocalPath, _}
+import java.net.InetAddress
 import java.util.zip.{ZipEntry, ZipInputStream, ZipOutputStream}
 
+import org.apache.commons.io.FileUtils
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
+
+import scala.util.Random
 
 object MiscHelper {
 
@@ -86,9 +87,24 @@ object MiscHelper {
     */
   def createLocalDir(path: String): String = {
     val file = new File(path)
-    file.delete()
+    FileUtils.deleteQuietly(file)
     file.mkdirs()
     file.getAbsolutePath.replace('\\','/')
+  }
+
+  /**
+    * get local host name without domain
+    */
+  def getHostName: String = {
+    InetAddress.getLocalHost.getHostName.takeWhile(c => c!='.')
+  }
+
+  /**
+    * get random integer of globally initialized Random object
+    */
+  private val randomInt = Random // init Random object
+  def getRandomInt: Int = {
+    Random.nextInt()
   }
 
   /**

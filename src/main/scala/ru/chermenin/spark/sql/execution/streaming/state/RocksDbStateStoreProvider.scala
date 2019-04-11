@@ -391,8 +391,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.valueSchema = valueSchema
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
-    this.localDataDir = MiscHelper.createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
-    this.localWalDataDir = MiscHelper.createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(hadoopConf.get("spark.app.name")))
+    this.localDataDir = MiscHelper.createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
+    this.localWalDataDir = MiscHelper.createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
     this.ttlSec = setTTL(storeConf.confs)
     this.isStrictExpire = setExpireMode(storeConf.confs)
     this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
@@ -405,6 +405,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     localBackupFs = localBackupPath.getFileSystem(hadoopConf)
     localDbDir = MiscHelper.createLocalDir(localDataDir+"/db")
     remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
+
+    // check schemas
+    // TODO
 
     // initialize empty database
     currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
@@ -638,7 +641,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       currentDb.close
       currentDb = null
     }
-    FileUtils.deleteDirectory(new File(localDataDir))
+    FileUtils.deleteQuietly(new File(localDataDir))
     logInfo(s"Removed local db and backup dir of $this")
   } catch {
     case e:Exception =>
@@ -817,10 +820,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   /**
     * Get name for local data directory.
+    * As this might be on a persistent volume we include the hostname to avoid conflicts
     */
-  private def getDataDirName(sparkJobName: String): String = {
-    // we need a random number to allow multiple streaming queries running with different state stores in the same spark job.
-    s"spark-$sparkJobName-${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-${stateStoreId_.storeName}-${math.abs(Random.nextInt)}"
+  private def getDataDirName(sparkJobName: Option[String]): String = {
+    val sparkJobNamePrep = sparkJobName.filter(!_.isEmpty).map(_+"-").getOrElse("")
+    // the state store name is in the current spark version empty (2.4.0)
+    val stateStoreNamePrep = Some(stateStoreId_.storeName).filter(!_.isEmpty).map(_+"-").getOrElse("")
+    // we need a random number to allow multiple streaming queries running with different state stores in the same spark job and executor.
+    s"spark-$sparkJobNamePrep${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-$stateStoreNamePrep${MiscHelper.getHostName}-${MiscHelper.getRandomInt}"
   }
 
   /**
@@ -830,7 +837,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val maxVersion = backupList.keys.max
     getStore(maxVersion).iterator()
   }
-
 }
 
 /**
