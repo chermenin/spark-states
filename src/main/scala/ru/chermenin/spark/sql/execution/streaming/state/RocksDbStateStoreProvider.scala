@@ -138,7 +138,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         } else getValue(key)
       }
       val returnValueLog = if(returnValue!=null) "result size is "+returnValue.getSizeInBytes else "no value found"
-      logInfo(s"get ${key.toSeq(keySchema)} took $t secs, $returnValueLog")
+      logDebug(s"get ${key.toSeq(keySchema)} took $t secs, $returnValueLog")
       returnValue
     } catch {
       case e:Exception =>
@@ -162,7 +162,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             keyCache.put(keyCopy, DUMMY_VALUE)
         }
       }
-      logInfo(s"put ${key.toSeq(keySchema)} took $t secs, size is ${value.getSizeInBytes}")
+      logDebug(s"put ${key.toSeq(keySchema)} took $t secs, size is ${value.getSizeInBytes}")
     } catch {
       case e:Exception =>
         logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'put' key ${key.toSeq(keySchema)} of $this")
@@ -482,13 +482,25 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
 
-        // cleanup potential differences between backuplist and effectively existing backups in backupEngine
+        // cleanup potential superfluous backups in backup engine compared to index/backuplist
         if(backupList.size>0) {
           backupEngine.getBackupInfo.asScala
             .filter(_.appMetadata().toLong > backupList.keys.max)
-            .foreach( backupInfo => Try(backupEngine.deleteBackup(backupInfo.backupId)))
+            .foreach { backupInfo =>
+              Try(backupEngine.deleteBackup(backupInfo.backupId))
+              logInfo(s"deleted superfluous backup for version ${backupInfo.appMetadata}, backupId ${backupInfo.backupId} from backup engine for $this")
+            }
         }
         cleanupOldBackups()
+
+        // check backupIds between backup engine and index/backuplist
+        backupEngine.getBackupInfo.asScala
+          .foreach{ backupEngineEntry =>
+            val version = backupEngineEntry.appMetadata.toLong
+            val backupListEntry = backupList.get(version)
+            if (backupListEntry.isEmpty) logWarning( s"missing backup in index/backuplist for version $version of $this")
+            else if (backupListEntry.get._1!=backupEngineEntry.backupId) logWarning( s"conflicting backupId's for version $version of $this. index/backuplist has backupId ${backupListEntry.get._1}, backupEngine has backupId ${backupEngineEntry.backupId}")
+          }
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
 
