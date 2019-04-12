@@ -481,6 +481,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
+
+        // cleanup potential differences between backuplist and effectively existing backups in backupEngine
+        if(backupList.size>0) {
+          backupEngine.getBackupInfo.asScala
+            .filter(_.appMetadata().toLong > backupList.keys.max)
+            .foreach( backupInfo => Try(backupEngine.deleteBackup(backupInfo.backupId)))
+        }
         cleanupOldBackups()
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
