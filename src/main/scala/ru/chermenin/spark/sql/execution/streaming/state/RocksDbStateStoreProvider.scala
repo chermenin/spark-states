@@ -450,7 +450,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
       // cleanup possible existing backup files
-      FileUtils.deleteQuietly(new File(localBackupDir))
+      FileUtils.deleteQuietly(new File(localBackupDir+"/*"))
 
       // read index file into backupList, otherwise extract backup information from archive files
       Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
