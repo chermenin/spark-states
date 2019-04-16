@@ -127,63 +127,63 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       *
       * @return a non-null row if the key exists in the store, otherwise null.
       */
-    override def get(key: UnsafeRow): UnsafeRow = try {
-      var returnValue: UnsafeRow = null
-      val t = MiscHelper.measureTime{
-        returnValue = if (isStrictExpire) {
-          Option(keyCache.getIfPresent(key)) match {
-            case Some(_) => getValue(key)
-            case None => null
-          }
-        } else getValue(key)
+    override def get(key: UnsafeRow): UnsafeRow = RocksDbStateStoreProvider.this.synchronized {
+      try {
+        var returnValue: UnsafeRow = null
+        val t = MiscHelper.measureTime {
+          returnValue = if (isStrictExpire) {
+            Option(keyCache.getIfPresent(key)) match {
+              case Some(_) => getValue(key)
+              case None => null
+            }
+          } else getValue(key)
+        }
+        val returnValueLog = if (returnValue != null) "result size is " + returnValue.getSizeInBytes else "no value found"
+        logDebug(s"get ${key.toSeq(keySchema)} took $t secs, $returnValueLog")
+        returnValue
+      } catch {
+        case e: Exception =>
+          logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'get' key ${key.toSeq(keySchema)} of $this")
+          throw e
       }
-      val returnValueLog = if(returnValue!=null) "result size is "+returnValue.getSizeInBytes else "no value found"
-      logDebug(s"get ${key.toSeq(keySchema)} took $t secs, $returnValueLog")
-      returnValue
-    } catch {
-      case e:Exception =>
-        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'get' key ${key.toSeq(keySchema)} of $this")
-        throw e
     }
 
     /**
       * Put a new value for a non-null key. Implementations must be aware that the UnsafeRows in
       * the params can be reused, and must make copies of the data as needed for persistence.
       */
-    override def put(key: UnsafeRow, value: UnsafeRow): Unit = try {
-      MiscHelper.verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
-      val t = MiscHelper.measureTime {
-        val keyCopy = key.copy()
-        val valueCopy = value.copy()
-        RocksDbStateStoreProvider.this.synchronized {
+    override def put(key: UnsafeRow, value: UnsafeRow): Unit = RocksDbStateStoreProvider.this.synchronized {
+      try {
+        MiscHelper.verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
+        val t = MiscHelper.measureTime {
+          val keyCopy = key.copy()
+          val valueCopy = value.copy()
           currentDb.put(writeOptions, keyCopy.getBytes, valueCopy.getBytes)
 
-          if (isStrictExpire)
-            keyCache.put(keyCopy, DUMMY_VALUE)
+          if (isStrictExpire) keyCache.put(keyCopy, DUMMY_VALUE)
         }
+        logDebug(s"put ${key.toSeq(keySchema)} took $t secs, size is ${value.getSizeInBytes}")
+      } catch {
+        case e:Exception =>
+          logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'put' key ${key.toSeq(keySchema)} of $this")
+          throw e
       }
-      logDebug(s"put ${key.toSeq(keySchema)} took $t secs, size is ${value.getSizeInBytes}")
-    } catch {
-      case e:Exception =>
-        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'put' key ${key.toSeq(keySchema)} of $this")
-        throw e
     }
 
     /**
       * Remove a single non-null key.
       */
-    override def remove(key: UnsafeRow): Unit = try {
-      MiscHelper.verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
-      RocksDbStateStoreProvider.this.synchronized {
+    override def remove(key: UnsafeRow): Unit = RocksDbStateStoreProvider.this.synchronized {
+      try {
+        MiscHelper.verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
         currentDb.delete(key.getBytes)
 
-        if (isStrictExpire)
-          keyCache.invalidate(key.getBytes)
+        if (isStrictExpire) keyCache.invalidate(key.getBytes)
+      } catch {
+        case e:Exception =>
+          logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'remove' of $this")
+          throw e
       }
-    } catch {
-      case e:Exception =>
-        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'remove' of $this")
-        throw e
     }
 
     /**
@@ -207,27 +207,27 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     /**
       * Commit all the updates that have been made to the store, and return the new version.
       */
-    override def commit(): Long = try {
-      MiscHelper.verify(state == State.Updating, "Cannot commit already committed or aborted state")
+    override def commit(): Long = RocksDbStateStoreProvider.this.synchronized  {
+      try {
+        MiscHelper.verify(state == State.Updating, "Cannot commit already committed or aborted state")
 
-      updateStatistics()
+        updateStatistics()
 
-      state = State.Committed
-      RocksDbStateStoreProvider.this.synchronized {
+        state = State.Committed
         createBackup(newVersion)
         if (closeDbOnCommit) {
           currentDb.close()
           currentDb = null
         }
+
+        logInfo(s"Committed version $newVersion for $this")
+        newVersion
+
+      } catch {
+        case e: Exception =>
+          logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'commit' for version $newVersion of $this")
+          throw e
       }
-
-      logInfo(s"Committed version $newVersion for $this")
-      newVersion
-
-    } catch {
-      case e:Exception =>
-        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'commit' for version $newVersion of $this")
-        throw e
     }
 
     def updateStatistics(): Unit = {
@@ -251,30 +251,33 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     /**
       * Abort all the updates made on this store. This store will not be usable any more.
       */
-    override def abort(): Unit = try {
-      MiscHelper.verify(state != State.Committed, "Cannot abort already committed state")
-      //TODO: how can we rollback uncommitted changes -> we should use a transaction!
+    override def abort(): Unit = RocksDbStateStoreProvider.this.synchronized {
+      try {
+        MiscHelper.verify(state != State.Committed, "Cannot abort already committed state")
+        //TODO: how can we rollback uncommitted changes -> we should use a transaction!
 
-      updateStatistics()
+        updateStatistics()
 
-      state = State.Aborted
-      if (closeDbOnCommit) RocksDbStateStoreProvider.this.synchronized {
-        currentDb.close()
-        currentDb = null
+        state = State.Aborted
+        if (closeDbOnCommit) {
+          currentDb.close()
+          currentDb = null
+        }
+
+        logInfo(s"Aborted version $newVersion for $this")
+
+      } catch {
+        case e: Exception =>
+          logWarning(s"Error aborting version $newVersion into $this", e)
       }
-
-      logInfo(s"Aborted version $newVersion for $this")
-
-    } catch {
-      case e: Exception =>
-        logWarning(s"Error aborting version $newVersion into $this", e)
     }
 
     /**
       * Get an iterator of all the store data.
-      * This can be called only after committing all the updates made in the current thread.
       */
-    override def iterator(): Iterator[UnsafeRowPair] = {
+    override def iterator(): Iterator[UnsafeRowPair] = synchronized {
+      MiscHelper.verify(currentDb != null, "iterator can only be created if RocksDB is still opened")
+
       val stateFromRocksIter: Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
 
         /** Internal RocksDb iterator */
@@ -385,58 +388,60 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
                     valueSchema: StructType,
                     indexOrdinal: Option[Int],
                     storeConf: StateStoreConf,
-                    hadoopConf: Configuration): Unit = try {
-    this.stateStoreId_ = stateStoreId
-    this.keySchema = keySchema
-    this.valueSchema = valueSchema
-    this.storeConf = storeConf
-    this.hadoopConf = hadoopConf
-    this.localDataDir = MiscHelper.createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
-    this.localWalDataDir = MiscHelper.createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
-    this.ttlSec = setTTL(storeConf.confs)
-    this.isStrictExpire = setExpireMode(storeConf.confs)
-    this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
-    this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
+                    hadoopConf: Configuration): Unit = synchronized {
+    try {
+      this.stateStoreId_ = stateStoreId
+      this.keySchema = keySchema
+      this.valueSchema = valueSchema
+      this.storeConf = storeConf
+      this.hadoopConf = hadoopConf
+      this.localDataDir = MiscHelper.createLocalDir( setLocalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
+      this.localWalDataDir = MiscHelper.createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
+      this.ttlSec = setTTL(storeConf.confs)
+      this.isStrictExpire = setExpireMode(storeConf.confs)
+      this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
+      this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
 
-    // initialize paths
-    remoteBackupPath = stateStoreId.storeCheckpointLocation()
-    localBackupDir = MiscHelper.createLocalDir(localDataDir+"/backup")
-    localBackupPath = new Path("file:///"+localBackupDir)
-    localBackupFs = localBackupPath.getFileSystem(hadoopConf)
-    localDbDir = MiscHelper.createLocalDir(localDataDir+"/db")
-    remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
+      // initialize paths
+      remoteBackupPath = stateStoreId.storeCheckpointLocation()
+      localBackupDir = MiscHelper.createLocalDir(localDataDir+"/backup")
+      localBackupPath = new Path("file:///"+localBackupDir)
+      localBackupFs = localBackupPath.getFileSystem(hadoopConf)
+      localDbDir = MiscHelper.createLocalDir(localDataDir+"/db")
+      remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
 
-    // check schemas
-    // TODO
+      // check schemas
+      // TODO
 
-    // initialize empty database
-    currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
+      // initialize empty database
+      currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
 
-    options = new Options()
-      .setStatistics(currentDbStats)
-      .setCreateIfMissing(true)
-      .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
-      .setMaxWriteBufferNumber( setWriteBufferNumber(storeConf.confs))
-      .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
-      // .setDbWriteBufferSize() // this is the same as setWriteBufferSize*setMaxWriteBufferNumber
-      .setAllowMmapReads(false) // could be responsible for memory leaks according to https://github.com/facebook/rocksdb/issues/3216
-      .setAllowMmapWrites(false) // this could make memory leaks according to https://github.com/facebook/rocksdb/issues/3216
-      //.setTargetFileSizeBase(xxx * SizeUnit.MB))
-      .setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(false).setBlockCacheSize(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB))
-      .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
-      .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
-      .setCompressionType(setCompressionType(storeConf.confs))
-      .setCompactionStyle(CompactionStyle.UNIVERSAL)
-    writeOptions = new WriteOptions()
-      .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
+      options = new Options()
+        .setStatistics(currentDbStats)
+        .setCreateIfMissing(true)
+        .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
+        .setMaxWriteBufferNumber( setWriteBufferNumber(storeConf.confs))
+        .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
+        // .setDbWriteBufferSize() // this is the same as setWriteBufferSize*setMaxWriteBufferNumber
+        .setAllowMmapReads(false) // could be responsible for memory leaks according to https://github.com/facebook/rocksdb/issues/3216
+        .setAllowMmapWrites(false) // this could make memory leaks according to https://github.com/facebook/rocksdb/issues/3216
+        //.setTargetFileSizeBase(xxx * SizeUnit.MB))
+        .setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(false).setBlockCacheSize(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB))
+        .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
+        .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
+        .setCompressionType(setCompressionType(storeConf.confs))
+        .setCompactionStyle(CompactionStyle.UNIVERSAL)
+      writeOptions = new WriteOptions()
+        .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
 
-    restoreFromRemoteBackups()
+      restoreFromRemoteBackups()
 
-    logInfo(s"initialized $this")
-  } catch {
-    case e:Exception =>
-      logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'init' of $this")
-      throw e
+      logInfo(s"initialized $this")
+    } catch {
+      case e:Exception =>
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'init' of $this")
+        throw e
+    }
   }
 
   def restoreFromRemoteBackups(): Unit = {
@@ -450,7 +455,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
       // cleanup possible existing backup files
-      FileUtils.deleteQuietly(new File(localBackupDir+"/*"))
+      FileUtils.deleteQuietly(new File(localBackupDir + "/*"))
 
       // read index file into backupList, otherwise extract backup information from archive files
       Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
@@ -459,8 +464,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           val backupListParsed = backupListReader.lines.iterator.asScala.toArray.map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
           backupListInputStream.close() // it is tricky that input stream isn't closed at all or even twice... iterator.toArray / manual close seems to be proper
           backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-          logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map( b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
-        case Failure(_:FileNotFoundException) =>
+          logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
+        case Failure(_: FileNotFoundException) =>
           backupList ++= getBackupListFromRemoteFiles
           logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
         case Failure(e) => throw e
@@ -474,16 +479,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           .par.foreach(f => copyRemoteToLocalFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false))
 
         // copy metadata/private files according to backupList in parallel
-        backupList.values.map{ case (backupId,backupKey) => s"$backupKey.zip" }.par
+        backupList.values.map { case (backupId, backupKey) => s"$backupKey.zip" }.par
           .foreach(filename => try {
-            MiscHelper.decompressFromRemote( new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
+            MiscHelper.decompressFromRemote(new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
           } catch {
             case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
 
         // cleanup potential superfluous backups in backup engine compared to index/backuplist
-        if(backupList.size>0) {
+        if (backupList.size > 0) {
           backupEngine.getBackupInfo.asScala
             .filter(_.appMetadata().toLong > backupList.keys.max)
             .foreach { backupInfo =>
@@ -495,11 +500,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // check backupIds between backup engine and index/backuplist
         backupEngine.getBackupInfo.asScala
-          .foreach{ backupEngineEntry =>
+          .foreach { backupEngineEntry =>
             val version = backupEngineEntry.appMetadata.toLong
             val backupListEntry = backupList.get(version)
-            if (backupListEntry.isEmpty) logWarning( s"missing backup in index/backuplist for version $version of $this")
-            else if (backupListEntry.get._1!=backupEngineEntry.backupId) logWarning( s"conflicting backupId's for version $version of $this. index/backuplist has backupId ${backupListEntry.get._1}, backupEngine has backupId ${backupEngineEntry.backupId}")
+            if (backupListEntry.isEmpty) logWarning(s"missing backup in index/backuplist for version $version of $this")
+            else if (backupListEntry.get._1 != backupEngineEntry.backupId) logWarning(s"conflicting backupId's for version $version of $this. index/backuplist has backupId ${backupListEntry.get._1}, backupEngine has backupId ${backupEngineEntry.backupId}")
           }
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
@@ -508,26 +513,26 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"initializing state backup at $remoteBackupPath for $this")
       remoteBackupFm.mkdirs( new Path(remoteBackupPath, "shared"))
       backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
-      synchronized {
-        currentDb = openDb
-        createBackup(0L)
-        currentDb.close()
-        currentDb = null
-      }
+      currentDb = openDb
+      createBackup(0L)
+      currentDb.close()
+      currentDb = null
     }
   }
 
   /**
     * Get the state store for making updates to create a new `version` of the store.
     */
-  override def getStore(version: Long): StateStore = try {
-    getStore(version, createCache(ttlSec))
-  } catch {
-    case e:Exception =>
-      logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'getStore' of $this for version $version")
-      throw e
+  override def getStore(version: Long): StateStore = synchronized {
+    try {
+      getStore(version, createCache(ttlSec))
+    } catch {
+      case e:Exception =>
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'getStore' of $this for version $version")
+        throw e
+    }
   }
-  def getStore(version: Long, cache: MapType): StateStore = synchronized {
+  def getStore(version: Long, cache: MapType): StateStore = {
     require(version >= 0, "Version cannot be less than 0")
 
     // try restoring remote backups if version doesnt exists in local backups. This might happen if execution of a partition changes executor.
@@ -549,7 +554,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // check if current db is desired version, else search in backups and restore
     if (currentStore!=null && currentStore.getCommittedVersion.contains(version)) {
-      if (currentDb==null) synchronized {
+      if (currentDb==null) {
         currentDb = openDb
       }
       logDebug(s"Current db already has correct version $version. No restore required for $this.")
@@ -561,15 +566,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // close db and restore backup
       val tRestore = MiscHelper.measureTime {
-        synchronized {
-          if (currentDb != null) {
-            currentDb.close() // we need to close before restore
-            currentDb = null
-          }
-          val restoreOptions = new RestoreOptions(false)
-          backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
-          currentDb = openDb
+        if (currentDb != null) {
+          currentDb.close() // we need to close before restore
+          currentDb = null
         }
+        val restoreOptions = new RestoreOptions(false)
+        backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
+        currentDb = openDb
       }
       logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
 
@@ -607,15 +610,15 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /**
     * Do maintenance backing data files, including cleaning up old files
     */
-  override def doMaintenance(): Unit = try {
-    logDebug(s"starting doMaintenance for $this")
+  override def doMaintenance(): Unit = synchronized {
+    try {
+      logDebug(s"starting doMaintenance for $this")
 
-    var sharedFilesSize: Long = 0
-    val t = MiscHelper.measureTime {
+      var sharedFilesSize: Long = 0
+      val t = MiscHelper.measureTime {
 
-      // flush WAL to SST Files and do manual compaction
-      synchronized {
-        val opened = if (currentDb==null) {
+        // flush WAL to SST Files and do manual compaction
+        val opened = if (currentDb == null) {
           currentDb = openDb
           true
         } else false
@@ -627,50 +630,52 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           currentDb.close()
           currentDb = null
         }
+
+        // estimate db size
+        sharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath, "shared"))
+          .map(_.getLen).sum
+
+        // cleanup old backups
+        cleanupOldBackups()
+
+        // remove cleaned up backups from remote filesystem and backup list
+        val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
+        val removedBackups = backupList.keys.filter(v => !backupInfoVersions.contains(v))
+        if (!rotatingBackupKey) removedBackups
+          .map(v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
+          .foreach(f => remoteBackupFm.delete(f))
+        removedBackups.foreach(backupList.remove)
+        syncRemoteIndex()
+        logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+
+        // check free diskspace
+        //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
+        //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
       }
-
-      // estimate db size
-      sharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath,"shared"))
-        .map(_.getLen).sum
-
-      // cleanup old backups
-      cleanupOldBackups()
-
-      // remove cleaned up backups from remote filesystem and backup list
-      val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
-      val removedBackups = backupList.keys.filter( v => !backupInfoVersions.contains(v))
-      if (!rotatingBackupKey) removedBackups
-        .map( v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
-        .foreach( f => remoteBackupFm.delete( f ))
-      removedBackups.foreach(backupList.remove)
-      syncRemoteIndex()
-      logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
-
-      // check free diskspace
-      //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
-      //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
+      logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(sharedFilesSize)}")
+    } catch {
+      case e: Exception =>
+        logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'doMaintenance' of $this")
+        throw e
     }
-    logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(sharedFilesSize)}")
-  } catch {
-    case e:Exception =>
-      logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'doMaintenance' of $this")
-      throw e
   }
 
   /**
     * Called when the provider instance is unloaded from the executor.
     */
-  override def close(): Unit = try {
-    // cleanup
-    if(currentDb!=null) {
-      currentDb.close
-      currentDb = null
+  override def close(): Unit = synchronized {
+    try {
+      // cleanup
+      if(currentDb!=null) {
+        currentDb.close
+        currentDb = null
+      }
+      FileUtils.deleteQuietly(new File(localDataDir))
+      logInfo(s"Removed local db and backup dir of $this")
+    } catch {
+      case e:Exception =>
+        logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'close' of $this")
     }
-    FileUtils.deleteQuietly(new File(localDataDir))
-    logInfo(s"Removed local db and backup dir of $this")
-  } catch {
-    case e:Exception =>
-      logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'close' of $this")
   }
 
   /**
