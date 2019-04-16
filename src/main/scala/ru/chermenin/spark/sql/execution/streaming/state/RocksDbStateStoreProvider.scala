@@ -574,14 +574,17 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
 
       // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
-      val newerBackups = backupList.filter{ case (v,(b,k)) => v > version}
+      val newerBackups = (backupList.toSeq.map{ case (v,(b,k)) => (v,b)} ++
+          backupEngine.getBackupInfo.asScala.map( i => (i.appMetadata().toLong,i.backupId))
+        ).filter{ case (v,b) => v > version}
       val tCleanup = MiscHelper.measureTime {
         remoteCleanupList.clear
-        newerBackups.foreach{ case (v,(b,k)) =>
-          deleteBackup(b)
+        newerBackups.map{ case (v,b) => b}.distinct.foreach( deleteBackup )
+        newerBackups.map{ case (v,b) => v}.distinct.foreach { v =>
           backupList.remove(v)
-          remoteCleanupList += new Path(remoteBackupPath,s"${getBackupKey(v)}.zip")
+          remoteCleanupList += new Path(remoteBackupPath, s"${getBackupKey(v)}.zip")
         }
+
         backupEngine.garbageCollect()
 
         // delete unused shared data files to avoid later conflicts
@@ -589,7 +592,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unused remote files to delete for $this")
         remoteCleanupList ++= sharedFiles2Del
       }
-      if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
+      if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.map(_._1).distinct.sorted.mkString(", ")} for $this, took $tCleanup secs")
     }
   }
 
@@ -768,7 +771,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def deleteBackup(backupId:Int): Unit = {
     Try(backupEngine.deleteBackup(backupId)) match {
-      case Failure(e) => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' while deleting backup with backupId $b for $this")
+      case Failure(e) => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' while deleting backup with backupId $backupId for $this")
       case _ => Unit
     }
   }
