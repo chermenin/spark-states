@@ -487,7 +487,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           backupEngine.getBackupInfo.asScala
             .filter(_.appMetadata().toLong > backupList.keys.max)
             .foreach { backupInfo =>
-              Try(backupEngine.deleteBackup(backupInfo.backupId))
+              deleteBackup(backupInfo.backupId)
               logInfo(s"deleted superfluous backup for version ${backupInfo.appMetadata}, backupId ${backupInfo.backupId} from backup engine for $this")
             }
         }
@@ -578,7 +578,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val tCleanup = MiscHelper.measureTime {
         remoteCleanupList.clear
         newerBackups.foreach{ case (v,(b,k)) =>
-          Try(backupEngine.deleteBackup(b))
+          deleteBackup(b)
           backupList.remove(v)
           remoteCleanupList += new Path(remoteBackupPath,s"${getBackupKey(v)}.zip")
         }
@@ -586,7 +586,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // delete unused shared data files to avoid later conflicts
         val (_,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
-        if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unsed remote files to delete for $this")
+        if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unused remote files to delete for $this")
         remoteCleanupList ++= sharedFiles2Del
       }
       if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.keys.toSeq.sorted.mkString(", ")} for $this, took $tCleanup secs")
@@ -758,9 +758,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private def cleanupOldBackups(): Unit = {
     val backupsSorted = backupEngine.getBackupInfo.asScala.toSeq.sortBy(_.appMetadata().toLong)
     val backupsToDelete = backupsSorted.take(backupsSorted.size-storeConf.minVersionsToRetain)
-    backupsToDelete.foreach( b => backupEngine.deleteBackup(b.backupId()))
+    backupsToDelete.foreach( b => deleteBackup(b.backupId()))
     backupEngine.garbageCollect()
     logDebug( s"backup engine contains the following backups for $this: " + backupEngine.getBackupInfo.asScala.map(b => s"v=${b.appMetadata()},b=${b.backupId}").mkString("; "))
+  }
+
+  /**
+    * delete backup from backup engine
+    */
+  private def deleteBackup(backupId:Int): Unit = {
+    Try(backupEngine.deleteBackup(backupId)) match {
+      case Failure(e) => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' while deleting backup with backupId $b for $this")
+      case _ => Unit
+    }
   }
 
   /**
