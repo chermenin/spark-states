@@ -199,7 +199,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * @return An iterator of key-value pairs that is guaranteed not miss any key between start and
       *         end, both inclusive.
       */
-    override def getRange(start: Option[UnsafeRow], end: Option[UnsafeRow]): Iterator[UnsafeRowPair] = {
+    override def getRange(start: Option[UnsafeRow], end: Option[UnsafeRow]): Iterator[UnsafeRowPair] = RocksDbStateStoreProvider.this.synchronized {
       MiscHelper.verify(state == State.Updating, "Cannot getRange from already committed or aborted state")
       iterator()
     }
@@ -275,7 +275,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     /**
       * Get an iterator of all the store data.
       */
-    override def iterator(): Iterator[UnsafeRowPair] = synchronized {
+    override def iterator(): Iterator[UnsafeRowPair] = RocksDbStateStoreProvider.this.synchronized {
       MiscHelper.verify(currentDb != null, "iterator can only be created if RocksDB is still opened")
 
       val stateFromRocksIter: Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
@@ -436,7 +436,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       restoreFromRemoteBackups()
 
-      logInfo(s"initialized $this")
+      logInfo(s"initialized $this, localDataDir=$localDataDir, localWalDataDir=$localWalDataDir")
     } catch {
       case e:Exception =>
         logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'init' of $this")
@@ -444,7 +444,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
   }
 
-  def restoreFromRemoteBackups(): Unit = {
+  protected def restoreFromRemoteBackups(): Unit = {
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
       .setShareTableFiles(true)
@@ -532,7 +532,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         throw e
     }
   }
-  def getStore(version: Long, cache: MapType): StateStore = {
+  protected def getStore(version: Long, cache: MapType): StateStore = {
     require(version >= 0, "Version cannot be less than 0")
 
     // try restoring remote backups if version doesnt exists in local backups. This might happen if execution of a partition changes executor.
