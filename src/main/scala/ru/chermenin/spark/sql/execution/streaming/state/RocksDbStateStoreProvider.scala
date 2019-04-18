@@ -455,21 +455,24 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
       // cleanup possible existing backup files
-      FileUtils.deleteQuietly(new File(localBackupDir + "/*"))
+      // Note: deleting localBackupDir on Windows results in permission errors in unit tests... we do the cleanup only for linux for now
+      if (!System.getProperty("os.name").toLowerCase.contains("windows")) {
+        FileUtils.deleteQuietly(new File(localBackupDir))
+      }
 
       // read index file into backupList, otherwise extract backup information from archive files
-      Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
+      val backupList = Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
         case Success(backupListInputStream) =>
           val backupListReader = new BufferedReader(new InputStreamReader(backupListInputStream))
           val backupListParsed = backupListReader.lines.iterator.asScala.toArray.map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
           backupListInputStream.close() // it is tricky that input stream isn't closed at all or even twice... iterator.toArray / manual close seems to be proper
-          backupList ++= backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-          logDebug(s"index contains the following backups for $this:" + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
+          backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
         case Failure(_: FileNotFoundException) =>
-          backupList ++= getBackupListFromRemoteFiles
-          logWarning(s"index file not found on remote filesystem for $this. Extracted the following backup list of archive files: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
+          logWarning(s"index file not found on remote filesystem for $this. Extracted the backup list from archive files.")
+          getBackupListFromRemoteFiles
         case Failure(e) => throw e
       }
+      logDebug(s"backup list for $this: " + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
 
       // load files
       val t = MiscHelper.measureTime {
@@ -507,6 +510,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             else if (backupListEntry.get._1 != backupEngineEntry.backupId) logWarning(s"conflicting backupId's for version $version of $this. index/backuplist has backupId ${backupListEntry.get._1}, backupEngine has backupId ${backupEngineEntry.backupId}")
           }
       }
+      this.backupList ++= backupList // copy local backup list variable to state variable if everything went smooth.
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
 
     } else {
