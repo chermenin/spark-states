@@ -536,7 +536,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         throw e
     }
   }
-  protected def getStore(version: Long, cache: MapType): StateStore = {
+  protected[state] def getStore(version: Long, cache: MapType): StateStore = {
     require(version >= 0, "Version cannot be less than 0")
 
     // try restoring remote backups if version doesnt exists in local backups. This might happen if execution of a partition changes executor.
