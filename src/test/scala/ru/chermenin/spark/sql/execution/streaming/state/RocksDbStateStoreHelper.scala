@@ -16,6 +16,8 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
+import java.lang.management.ManagementFactory
+
 import org.apache.hadoop.conf.Configuration
 import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper.{newDir, rowsToStringInt, stringToRow}
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId}
@@ -132,5 +134,30 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_STRICT_MODE, isStrict.toString)
 
     sqlConf
+  }
+
+  private lazy val memoryMXBean = ManagementFactory.getMemoryMXBean
+  private lazy val mBeanServer = ManagementFactory.getPlatformMBeanServer
+  private lazy val pid = ManagementFactory.getRuntimeMXBean.getName.split("@")(0)
+
+  def getMemoryUtilization: Map[String,Long] = {
+    val heap = memoryMXBean.getHeapMemoryUsage
+    val nonHeap = memoryMXBean.getNonHeapMemoryUsage
+    Map(
+      "heapMemoryUsed" -> heap.getUsed,
+      "heapMemoryCommitted" -> heap.getCommitted,
+      "heapMemoryMax" -> heap.getMax,
+      "nonheapMemoryUsed" -> nonHeap.getUsed,
+      "nonheapMemoryCommitted" -> nonHeap.getCommitted,
+      "nonheapMemoryMax" -> nonHeap.getMax
+    )
+  }
+
+  private def getCGroupMemStat = {
+    val commandString = s"cat /sys/fs/cgroup/memory/memory.stat"
+    val cmd = Array("/bin/sh", "-c", commandString)
+    val p = Runtime.getRuntime.exec(cmd)
+    val result = scala.io.Source.fromInputStream(p.getInputStream)
+    result.getLines().toSeq.map(_.split(" ")).filter(_.size>=2).map( v => v(0)->v(1)).toMap
   }
 }
