@@ -871,7 +871,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // the state store name is in the current spark version empty (2.4.0)
     val stateStoreNamePrep = Some(stateStoreId_.storeName).filter(!_.isEmpty).map(_+"-").getOrElse("")
     // we need a random number to allow multiple streaming queries running with different state stores in the same spark job and executor.
-    s"spark-$sparkJobNamePrep${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-$stateStoreNamePrep${MiscHelper.getHostName}-${MiscHelper.getRandomInt}"
+    s"sparklocalstate-$sparkJobNamePrep${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-$stateStoreNamePrep${MiscHelper.getHostName}-${MiscHelper.getRandomInt}"
   }
 
   /**
@@ -922,11 +922,11 @@ object RocksDbStateStoreProvider {
 
   final val STATE_LOCAL_DIR: String = "spark.sql.streaming.stateStore.localDir"
 
-  final val DEFAULT_STATE_LOCAL_DIR: String = System.getProperty("java.io.tmpdir").replace('\\','/')
+  final val DEFAULT_STATE_LOCAL_DIR: String = Option(System.getenv("SPARK_LOCAL_DIRS")).map(_.split(',').head).getOrElse(getJavaTempDir)
 
   final val STATE_LOCAL_WAL_DIR: String = "spark.sql.streaming.stateStore.localWalDir"
 
-  final val DEFAULT_STATE_LOCAL_WAL_DIR: String = DEFAULT_STATE_LOCAL_DIR
+  final val DEFAULT_STATE_LOCAL_WAL_DIR: String = getJavaTempDir
 
   final val STATE_ROTATING_BACKUP_KEYS: String = "spark.sql.streaming.stateStore.rotatingBackupKeys"
 
@@ -941,6 +941,8 @@ object RocksDbStateStoreProvider {
   final val DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT: String = "true"
 
   final val DUMMY_VALUE: String = ""
+
+  private def getJavaTempDir = System.getProperty("java.io.tmpdir").replace('\\', '/')
 
   private def createCache(stateTtlSecs: Long): MapType = {
     val loader = new CacheLoader[UnsafeRow, String] {
