@@ -415,7 +415,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // initialize empty database
       currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
-
       options = new Options()
         .setStatistics(currentDbStats)
         .setCreateIfMissing(true)
@@ -426,7 +425,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .setAllowMmapReads(false) // could be responsible for memory leaks according to https://github.com/facebook/rocksdb/issues/3216
         .setAllowMmapWrites(false) // this could make memory leaks according to https://github.com/facebook/rocksdb/issues/3216
         //.setTargetFileSizeBase(xxx * SizeUnit.MB))
-        .setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(false).setBlockCacheSize(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB))
+        //.setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(false).setBlockCacheSize(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB))
+        //.setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(true))
+        .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(getGlobalBlockCache(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB)))
         .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
         .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
         .setCompressionType(setCompressionType(storeConf.confs))
@@ -456,7 +457,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // cleanup possible existing backup files
       // Note: deleting localBackupDir on Windows results in permission errors in unit tests... we do the cleanup only for linux for now
-      if (!System.getProperty("os.name").toLowerCase.contains("windows")) {
+      if (!MiscHelper.isWindowsOS) {
         FileUtils.deleteQuietly(new File(localBackupDir))
       }
 
@@ -891,18 +892,15 @@ object RocksDbStateStoreProvider {
 
   /** Default write buffer size for RocksDb in megabytes */
   final val WRITE_BUFFER_SIZE_MB: String = "spark.sql.streaming.stateStore.writeBufferSizeMb"
-
   val DEFAULT_WRITE_BUFFER_SIZE_MB = 64
 
   /** Default write buffer number for RocksDb: as we normally close Rocksdb after each commit (see also closeDbAfterCommit),
     * multiple write buffers don't make sense as each key of the spark partition is read/written at most once */
   final val WRITE_BUFFER_NUMBER: String = "spark.sql.streaming.stateStore.writeBufferSizeMb"
-
   val DEFAULT_WRITE_BUFFER_NUMBER = 1
 
   /** Default block cache size for RocksDb in megabytes */
   final val BLOCK_CACHE_SIZE_MB: String = "spark.sql.streaming.stateStore.blockCacheSizeMb"
-
   val DEFAULT_BLOCK_CACHE_SIZE_MB = 128
 
   /** statistics */
@@ -1021,4 +1019,14 @@ object RocksDbStateStoreProvider {
       case Failure(e) => throw new IllegalArgumentException(e)
     }
 
+  /**
+    * we share a global block cache to avoid memory leaks because block cache is not cleaned up properly on db.close
+    */
+  private var globalBlockCache: Cache = null
+  def getGlobalBlockCache(size: Long): Cache = {
+    if (globalBlockCache==null) {
+      globalBlockCache = new LRUCache(size)
+    }
+    globalBlockCache
+  }
 }

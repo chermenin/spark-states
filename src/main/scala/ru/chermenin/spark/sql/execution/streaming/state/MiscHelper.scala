@@ -125,4 +125,9 @@ object MiscHelper {
     }
     nbToCharRecursion(nb)
   }
+
+  /**
+    * check if running on Windows OS
+    */
+  def isWindowsOS = System.getProperty("os.name").toLowerCase.contains("windows")
 }

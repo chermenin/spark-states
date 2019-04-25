@@ -26,6 +26,8 @@ import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructT
 import org.rocksdb.BackupEngine
 import org.scalatest.PrivateMethodTester
 import org.apache.spark.internal.Logging
+import oshi.SystemInfo
+import oshi.software.os.OperatingSystem
 
 import scala.util.Random
 import scala.collection.JavaConverters._
@@ -140,7 +142,10 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
   private lazy val mBeanServer = ManagementFactory.getPlatformMBeanServer
   private lazy val pid = ManagementFactory.getRuntimeMXBean.getName.split("@")(0)
 
-  def getMemoryUtilization: Map[String,Long] = {
+  /**
+    * get memory from jvm view
+    */
+  def getJavaMemoryUsage: Map[String,Long] = {
     val heap = memoryMXBean.getHeapMemoryUsage
     val nonHeap = memoryMXBean.getNonHeapMemoryUsage
     Map(
@@ -153,11 +158,26 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
     )
   }
 
-  private def getCGroupMemStat = {
-    val commandString = s"cat /sys/fs/cgroup/memory/memory.stat"
+  /**
+    * get memory of process from OS view for Windows
+    */
+  lazy val osInfo: OperatingSystem = new SystemInfo().getOperatingSystem()
+  def getWindowsProcessMemoryUsage : Long = {
+    osInfo.getProcess(osInfo.getProcessId).getResidentSetSize
+  }
+
+  def getLinuxProcessMemoryUsage: Map[String,Long] = {
+    val commandString = s"ps -p $pid u"
     val cmd = Array("/bin/sh", "-c", commandString)
     val p = Runtime.getRuntime.exec(cmd)
     val result = scala.io.Source.fromInputStream(p.getInputStream)
-    result.getLines().toSeq.map(_.split(" ")).filter(_.size>=2).map( v => v(0)->v(1)).toMap
+    val resultParsedLines = result.getLines().toSeq.map(_.toLowerCase.split(" ").filter(!_.isEmpty))
+    val resultParsed = resultParsedLines.head.zip(resultParsedLines(1)).toMap
+    val vsz = resultParsed("vsz").toLong
+    val rss = resultParsed("rss").toLong
+    Map(
+      "linuxMemoryVsz" -> vsz*1024,
+      "linuxMemoryRss" -> rss*1024,
+    )
   }
 }

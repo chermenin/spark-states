@@ -22,6 +22,8 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper._
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId, StateStoreProviderId}
+import org.apache.spark.sql.internal.SQLConf
+import org.rocksdb.util.SizeUnit
 import org.scalatest.{BeforeAndAfter, FunSuite}
 import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreHelper._
 
@@ -39,14 +41,19 @@ class RocksDbStateStoreMemorySuite extends FunSuite with BeforeAndAfter with Log
     require(!StateStore.isMaintenanceRunning)
   }
 
-  test("Memory Usage") {
-    val provider = createStoreProvider(opId = math.abs(Random.nextInt), partition = 0)
+  test("Memory leak") {
+    import MiscHelper.formatBytes
+    val blockCacheSizeMb = 10 // fix global block cache to 10MB
+    val conf = new SQLConf()
+    conf.setConfString("spark.sql.streaming.stateStore.blockCacheSizeMb", blockCacheSizeMb.toString)
+    val provider = createStoreProvider(opId = math.abs(Random.nextInt), partition = 0, sqlConf = conf)
     var currentVersion = 0
 
     def logMemory(comment:String = "") = {
-      val osMem = RocksDbStateStoreHelper.getMemoryUtilization
-      logInfo(s"memory $comment: "+osMem("nonheapMemoryUsed"))
-      osMem("nonheapMemoryUsed")
+      val jvmMem = RocksDbStateStoreHelper.getJavaMemoryUsage
+      val osMem = if(MiscHelper.isWindowsOS) RocksDbStateStoreHelper.getWindowsProcessMemoryUsage else RocksDbStateStoreHelper.getLinuxProcessMemoryUsage("linuxMemoryRss")
+      logInfo(s"memory usage $comment: osProcess=${formatBytes(osMem)} heap=${formatBytes(jvmMem("heapMemoryUsed"))} heapCommitted=${formatBytes(jvmMem("heapMemoryCommitted"))} nonheap=${formatBytes(jvmMem("nonheapMemoryUsed"))}")
+      osMem
     }
     def simulateVersion(): Unit = {
       val store = provider.getStore(currentVersion)
@@ -61,9 +68,12 @@ class RocksDbStateStoreMemorySuite extends FunSuite with BeforeAndAfter with Log
       logMemory()
     }
 
-    val baseMem = logMemory( "    ")
-    (1 to 10).foreach( _ => simulateVersion())
+    val baseMem = logMemory()
+    val t = MiscHelper.measureTime {
+      (1 to 10).foreach(_ => simulateVersion())
+    }
     val finalMem = logMemory()
-    assert(finalMem<=baseMem*1.1)
+    logInfo(s"unit test took $t secs")
+    assert(finalMem<=baseMem*1.1 + blockCacheSizeMb*SizeUnit.MB, s"Memory leak detected: baseProcessMemory=${formatBytes(baseMem)} finalProcessMemory=${formatBytes(finalMem)}")
   }
 }
