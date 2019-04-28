@@ -23,19 +23,20 @@ import java.util.zip.ZipInputStream
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FSDataInputStream, FileSystem, Path, PathFilter}
+import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.state._
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{DataType, StructType}
 import org.rocksdb.{TickerType, _}
 import org.rocksdb.util.SizeUnit
 import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.util.{Failure, Random, Success, Try}
+import scala.io.Source
+import scala.util.{Failure, Success, Try}
 
 /**
   * An implementation of [[StateStoreProvider]] and [[StateStore]] in which all the data is backed
@@ -369,6 +370,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var backupList: mutable.Map[Long,(Int,String)] = mutable.HashMap()
   private var remoteCleanupList: mutable.ArrayBuffer[Path] = mutable.ArrayBuffer()
   private var remoteBackupFm: CheckpointFileManager = _
+  private var remoteBackupSchemaPath: Path = _
+  private var backupSchemas: Seq[(Long,String,StructType)] = Seq()
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -409,9 +412,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       localBackupFs = localBackupPath.getFileSystem(hadoopConf)
       localDbDir = MiscHelper.createLocalDir(localDataDir+"/db")
       remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
-
-      // check schemas
-      // TODO
+      remoteBackupSchemaPath = new Path(remoteBackupPath, "schema")
 
       // initialize empty database
       currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
@@ -435,7 +436,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       writeOptions = new WriteOptions()
         .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
 
+      // restore backups from remote to local directory
       restoreFromRemoteBackups()
+
+      // read and check state schemas
+      val backupSchemaFiles = getRemoteBackupSchemaFiles
+      val latestVersion = Try(backupList.keys.max).getOrElse(-1l)
+      backupSchemas = backupSchemaFiles.flatMap( parseBackupSchemaFile(latestVersion))
+      val latestBackupKeySchema = getBackupKeySchema(latestVersion)
+      val latestBackupValueSchema = getBackupValueSchema(latestVersion)
+      if (latestBackupKeySchema.isEmpty) logWarning(s"latest backup key schema not found (version=$latestVersion)")
+      else if (latestBackupKeySchema.get!=keySchema) logWarning(s"latest backup key schema is different from current schema: latestBackup=${latestBackupKeySchema.get.json}, current=${keySchema.json}")
+      if (latestBackupValueSchema.isEmpty) logWarning(s"latest backup value schema not found (version=$latestVersion)")
+      else if (latestBackupValueSchema.get!=valueSchema) logWarning(s"latest backup value schema is different from current schema: latestBackup=${latestBackupValueSchema.get.json}, current=${valueSchema.json}")
 
       logInfo(s"initialized $this, localDataDir=$localDataDir, localWalDataDir=$localWalDataDir")
     } catch {
@@ -569,6 +582,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val backupIdRecovery = backupList.get(version).map{ case (b,k) => b }
         .getOrElse(throw new IllegalStateException(s"backup for version $version not found"))
 
+      // check schemas
+      val backupKeySchema = getBackupKeySchema(version)
+      if (backupKeySchema.isDefined && backupKeySchema.get!=keySchema) throw new IllegalStateException(s"backup key schema not compatible with current schema. backup: ${backupKeySchema.get.json}, current: ${keySchema.json}")
+      val backupValueSchema = getBackupValueSchema(version)
+      if (backupValueSchema.isDefined && backupValueSchema.get!=valueSchema) throw new IllegalStateException(s"backup value schema not compatible with current schema. backup: ${backupValueSchema.get.json}, current: ${valueSchema.json}")
+
       // close db and restore backup
       val tRestore = MiscHelper.measureTime {
         if (currentDb != null) {
@@ -599,6 +618,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         val (_,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
         if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unused remote files to delete for $this")
         remoteCleanupList ++= sharedFiles2Del
+
+        // delete future schema versions to avoid later conflicts
+        backupSchemas.filter(_._1>version).foreach { case (v,t,_) =>
+          remoteBackupFm.delete(new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(v,t)))
+        }
       }
       if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.map(_._1).distinct.sorted.mkString(", ")} for $this, took $tCleanup secs")
     }
@@ -739,6 +763,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
     MiscHelper.compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"), remoteBackupFm, getHadoopFileBufferSize, Some(localBackupDir))
+
+    // save schema if changed
+    val backupKeySchema = getBackupKeySchema(version)
+    if (backupKeySchema.isEmpty || backupKeySchema.get!=keySchema) writeRemoteBackupSchema(version, "key", keySchema)
+    val backupValueSchema = getBackupValueSchema(version)
+    if (backupValueSchema.isEmpty || backupValueSchema.get!=keySchema) writeRemoteBackupSchema(version, "value", valueSchema)
 
     // update index of backups
     backupList.find{ case (v,(b,k)) => k == backupKey}
@@ -882,6 +912,62 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val maxVersion = backupList.keys.max
     getStore(maxVersion).iterator()
   }
+
+  /*
+   * parse backup schema file
+   * if version is higher than given version, the corresponding file has to be ignored and deleted as it is from an uncomitted version...
+   */
+  private def parseBackupSchemaFile(latestVersion: Long)(path: Path): Option[(Long,String,StructType)] = Try {
+    val Array(version, typ, _) = path.getName.split('.')
+    if (version.toLong<=latestVersion) {
+      val is = remoteBackupFm.open(path)
+      val schemaStr = Source.fromInputStream(is).mkString
+      is.close()
+      val schema = DataType.fromJson(schemaStr).asInstanceOf[StructType]
+      Some(version.toLong, typ, schema)
+    } else {
+      remoteBackupFm.delete(path)
+      None
+    }
+  } match {
+    case Success(x) => x
+    case Failure(e) =>
+      logError(s"Could not read/parse schema $path. Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'parseBackupSchemaFile' of $this ")
+      throw e
+  }
+
+  /*
+   * lookup last backup before given version for given type key/value
+   */
+  private def getBackupSchema(version: Long, typ: String): Option[StructType] = {
+    backupSchemas.filter( s => s._1<=version && s._2==typ).sortBy(_._1).map(_._3).lastOption
+  }
+  def getBackupKeySchema(version: Long): Option[StructType] = getBackupSchema(version, "key")
+  def getBackupValueSchema(version: Long): Option[StructType] = getBackupSchema(version, "value")
+
+  /*
+   * list remote backup schema files
+   */
+  def getRemoteBackupSchemaFiles: Seq[Path] = {
+    remoteBackupFm.list(remoteBackupSchemaPath, new PathFilter {
+      override def accept(path: Path): Boolean = path.getName.endsWith(".schema")
+    }).map(_.getPath).toSeq
+  }
+
+  /*
+   * write remote backup schema file
+   */
+  def writeRemoteBackupSchema(version: Long, typ: String, schema: StructType): Unit = {
+    val os = remoteBackupFm.createAtomic( new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(version,typ)), false)
+    os.writeBytes(schema.prettyJson)
+    os.close
+    logInfo(s"created new backup $typ schema for version $version: ${schema.json}")
+  }
+
+  /**
+    * get filename for remote backup schema file
+    */
+  def getRemoteBackupSchemaFilename(version: Long, typ: String) = s"$version.$typ.schema"
 }
 
 /**
