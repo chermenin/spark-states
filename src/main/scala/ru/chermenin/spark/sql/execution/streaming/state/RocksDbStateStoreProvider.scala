@@ -446,9 +446,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val latestBackupKeySchema = getBackupKeySchema(latestVersion)
       val latestBackupValueSchema = getBackupValueSchema(latestVersion)
       if (latestBackupKeySchema.isEmpty) logWarning(s"latest backup key schema not found (version=$latestVersion)")
-      else if (latestBackupKeySchema.get!=keySchema) logWarning(s"latest backup key schema is different from current schema: latestBackup=${latestBackupKeySchema.get.json}, current=${keySchema.json}")
+      else if (keySchema!=null && latestBackupKeySchema.get!=keySchema) logWarning(s"latest backup key schema is different from current schema: latestBackup=${latestBackupKeySchema.get.json}, current=${keySchema.json}")
       if (latestBackupValueSchema.isEmpty) logWarning(s"latest backup value schema not found (version=$latestVersion)")
-      else if (latestBackupValueSchema.get!=valueSchema) logWarning(s"latest backup value schema is different from current schema: latestBackup=${latestBackupValueSchema.get.json}, current=${valueSchema.json}")
+      else if (valueSchema!=null && latestBackupValueSchema.get!=valueSchema) logWarning(s"latest backup value schema is different from current schema: latestBackup=${latestBackupValueSchema.get.json}, current=${valueSchema.json}")
 
       logInfo(s"initialized $this, localDataDir=$localDataDir, localWalDataDir=$localWalDataDir")
     } catch {
@@ -584,9 +584,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // check schemas
       val backupKeySchema = getBackupKeySchema(version)
-      if (backupKeySchema.isDefined && backupKeySchema.get!=keySchema) throw new IllegalStateException(s"backup key schema not compatible with current schema. backup: ${backupKeySchema.get.json}, current: ${keySchema.json}")
+      if (backupKeySchema.isDefined && keySchema!=null && backupKeySchema.get!=keySchema) throw new IllegalStateException(s"backup key schema not compatible with current schema. backup: ${backupKeySchema.get.json}, current: ${keySchema.json}")
       val backupValueSchema = getBackupValueSchema(version)
-      if (backupValueSchema.isDefined && backupValueSchema.get!=valueSchema) throw new IllegalStateException(s"backup value schema not compatible with current schema. backup: ${backupValueSchema.get.json}, current: ${valueSchema.json}")
+      if (backupValueSchema.isDefined && valueSchema!=null && backupValueSchema.get!=valueSchema) throw new IllegalStateException(s"backup value schema not compatible with current schema. backup: ${backupValueSchema.get.json}, current: ${valueSchema.json}")
 
       // close db and restore backup
       val tRestore = MiscHelper.measureTime {
@@ -620,8 +620,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         remoteCleanupList ++= sharedFiles2Del
 
         // delete future schema versions to avoid later conflicts
-        backupSchemas.filter(_._1>version).foreach { case (v,t,_) =>
-          remoteBackupFm.delete(new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(v,t)))
+        backupSchemas.filter(_._1>version).foreach{ case (v,t,_) =>
+          val path = new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(v,t))
+          logInfo(s"found future schema version to delete for $this")
+          remoteCleanupList += path
         }
       }
       if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.map(_._1).distinct.sorted.mkString(", ")} for $this, took $tCleanup secs")
@@ -766,9 +768,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
     // save schema if changed
     val backupKeySchema = getBackupKeySchema(version)
-    if (backupKeySchema.isEmpty || backupKeySchema.get!=keySchema) writeRemoteBackupSchema(version, "key", keySchema)
+    if (backupKeySchema.isEmpty || (keySchema!=null && backupKeySchema.get!=keySchema)) writeRemoteBackupSchema(version, "key", keySchema)
     val backupValueSchema = getBackupValueSchema(version)
-    if (backupValueSchema.isEmpty || backupValueSchema.get!=keySchema) writeRemoteBackupSchema(version, "value", valueSchema)
+    if (backupValueSchema.isEmpty || (valueSchema!=null && backupValueSchema.get!=keySchema)) writeRemoteBackupSchema(version, "value", valueSchema)
 
     // update index of backups
     backupList.find{ case (v,(b,k)) => k == backupKey}
@@ -960,7 +962,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   def writeRemoteBackupSchema(version: Long, typ: String, schema: StructType): Unit = {
     val os = remoteBackupFm.createAtomic( new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(version,typ)), false)
     os.writeBytes(schema.prettyJson)
-    os.close
+    os.close()
     logInfo(s"created new backup $typ schema for version $version: ${schema.json}")
   }
 
