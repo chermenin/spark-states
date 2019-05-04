@@ -92,7 +92,6 @@ import scala.util.{Failure, Success, Try}
   * This is an old bug which might be solved in Java 10 or 11, see https://bugs.java.com/bugdatabase/view_bug.do?bug_id=4715154
   *
   *  TODO: What happens when backupId overflows (backupId is an integer, but version is long)
-  *  TODO: Enable checksum in BackupOptions again?
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._ // import companion object
@@ -459,7 +458,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
       .setShareTableFiles(true)
-      .setShareFilesWithChecksum(false)
+      .setShareFilesWithChecksum(true)
       .setSync(true)
     backupList.clear
     if (remoteBackupFm.exists(remoteBackupPath)) {
