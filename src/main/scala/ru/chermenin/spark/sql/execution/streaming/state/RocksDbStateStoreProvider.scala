@@ -975,7 +975,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 /**
   * Companion object with constants.
   */
-object RocksDbStateStoreProvider {
+object RocksDbStateStoreProvider extends Logging {
   type MapType = com.google.common.cache.LoadingCache[UnsafeRow, String]
 
   /** Default write buffer size for RocksDb in megabytes */
@@ -1114,6 +1114,7 @@ object RocksDbStateStoreProvider {
   def getGlobalBlockCache(size: Long): Cache = {
     if (globalBlockCache==null) {
       globalBlockCache = new LRUCache(size)
+      logInfo(s"initialize global block cache with size ${MiscHelper.formatBytes(size)}")
     }
     globalBlockCache
   }
