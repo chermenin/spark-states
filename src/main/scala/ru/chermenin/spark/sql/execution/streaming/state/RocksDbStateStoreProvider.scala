@@ -421,7 +421,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .setCreateIfMissing(true)
         .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
         .setMaxWriteBufferNumber( setWriteBufferNumber(storeConf.confs))
-        .setMaxWriteBufferNumber(RocksDbStateStoreProvider.DEFAULT_WRITE_BUFFER_NUMBER)
         // .setDbWriteBufferSize() // this is the same as setWriteBufferSize*setMaxWriteBufferNumber
         .setAllowMmapReads(false) // could be responsible for memory leaks according to https://github.com/facebook/rocksdb/issues/3216
         .setAllowMmapWrites(false) // this could make memory leaks according to https://github.com/facebook/rocksdb/issues/3216
