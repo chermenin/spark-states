@@ -31,7 +31,6 @@ import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.rocksdb.{TickerType, _}
 import org.rocksdb.util.SizeUnit
-import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -96,6 +95,7 @@ import scala.util.{Failure, Success, Try}
   *  TODO: Enable checksum in BackupOptions again?
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
+  import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider._ // import companion object
 
   /** Load native RocksDb library */
   RocksDB.loadLibrary()
@@ -243,8 +243,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       //log volume statistics
       rocksdbVolumeStatistics = ROCKSDB_VOLUME_PROPERTIES.map{ p =>
-        if (p==ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY && isStrictExpire) p->keyCache.size
-        else p->currentDb.getLongProperty(p)
+        if (p==ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY && isStrictExpire) p -> keyCache.size
+        else p -> (if (currentDb!=null) currentDb.getLongProperty(p) else -1l)
       }.toMap
       logInfo(s"rocksdb volume statistics for $this: "+rocksdbVolumeStatistics.map{ case (k,v) => s"$k=$v"}.mkString(" "))
     }
@@ -257,10 +257,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         MiscHelper.verify(state != State.Committed, "Cannot abort already committed state")
         //TODO: how can we rollback uncommitted changes -> we should use a transaction!
 
-        updateStatistics()
-
         state = State.Aborted
-        if (closeDbOnCommit) {
+        if (closeDbOnCommit && currentDb!=null) {
           currentDb.close()
           currentDb = null
         }
@@ -1110,7 +1108,7 @@ object RocksDbStateStoreProvider extends Logging {
     * we share a global block cache to avoid memory leaks because block cache is not cleaned up properly on db.close
     */
   private var globalBlockCache: Cache = null
-  def getGlobalBlockCache(size: Long): Cache = {
+  def getGlobalBlockCache(size: Long): Cache = synchronized {
     if (globalBlockCache==null) {
       globalBlockCache = new LRUCache(size)
       logInfo(s"initialize global block cache with size ${MiscHelper.formatBytes(size)}")
