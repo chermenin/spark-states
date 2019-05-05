@@ -103,8 +103,8 @@ object MiscHelper {
     * get random integer of globally initialized Random object
     */
   private val randomInt = Random // init Random object
-  def getRandomInt: Int = {
-    Random.nextInt()
+  def getRandomPositiveInt: Int = {
+    math.abs(Random.nextInt())
   }
 
   /**

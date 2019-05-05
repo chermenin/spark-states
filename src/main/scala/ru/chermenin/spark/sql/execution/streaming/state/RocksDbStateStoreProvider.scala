@@ -900,7 +900,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // the state store name is in the current spark version empty (2.4.0)
     val stateStoreNamePrep = Some(stateStoreId_.storeName).filter(!_.isEmpty).map(_+"-").getOrElse("")
     // we need a random number to allow multiple streaming queries running with different state stores in the same spark job and executor.
-    s"sparklocalstate-$sparkJobNamePrep${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-$stateStoreNamePrep${MiscHelper.getHostName}-${MiscHelper.getRandomInt}"
+    s"sparklocalstate-$sparkJobNamePrep${stateStoreId_.operatorId}-${stateStoreId_.partitionId}-$stateStoreNamePrep${MiscHelper.getHostName}-${MiscHelper.getRandomPositiveInt}"
   }
 
   /**
