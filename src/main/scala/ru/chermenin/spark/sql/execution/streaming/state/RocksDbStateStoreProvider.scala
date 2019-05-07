@@ -458,7 +458,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // copy backups from remote storage and init backup engine
     val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
       .setShareTableFiles(true)
-      .setShareFilesWithChecksum(true)
+      .setShareFilesWithChecksum(setShareRocksDbFilesWithChecksum(storeConf.confs))
       .setSync(true)
     backupList.clear
     if (remoteBackupFm.exists(remoteBackupPath)) {
@@ -1022,6 +1022,10 @@ object RocksDbStateStoreProvider extends Logging {
 
   final val DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT: String = "true"
 
+  final val SHARE_ROCKSDB_FILES_WITH_CHECKSUM: String = "spark.sql.streaming.stateStore.shareRocksDbFilesWithChecksum"
+
+  final val DEFAULT_SHARE_ROCKSDB_FILES_WITH_CHECKSUM: String = "false"
+
   final val DUMMY_VALUE: String = ""
 
   private def getJavaTempDir = System.getProperty("java.io.tmpdir").replace('\\', '/')
@@ -1099,6 +1103,12 @@ object RocksDbStateStoreProvider extends Logging {
 
   private def setCloseDbAfterCommit(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(STATE_CLOSE_DB_AFTER_COMMIT, DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setShareRocksDbFilesWithChecksum(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(SHARE_ROCKSDB_FILES_WITH_CHECKSUM, DEFAULT_SHARE_ROCKSDB_FILES_WITH_CHECKSUM).toBoolean) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
