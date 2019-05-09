@@ -945,10 +945,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /*
    * list remote backup schema files
    */
-  def getRemoteBackupSchemaFiles: Seq[Path] = {
+  def getRemoteBackupSchemaFiles: Seq[Path] = try {
     remoteBackupFm.list(remoteBackupSchemaPath, new PathFilter {
       override def accept(path: Path): Boolean = path.getName.endsWith(".schema")
     }).map(_.getPath).toSeq
+  } catch {
+    case _:FileNotFoundException =>
+      logInfo(s"remote backup schema path $remoteBackupSchemaPath is not existing")
+      Seq()
   }
 
   /*
