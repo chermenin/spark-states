@@ -369,6 +369,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var remoteBackupFm: CheckpointFileManager = _
   private var remoteBackupSchemaPath: Path = _
   private var backupSchemas: Seq[(Long,String,StructType)] = Seq()
+  private var backupKeySchemaUpToDate = false
+  private var backupValueSchemaUpToDate = false
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -763,10 +765,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     MiscHelper.compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"), remoteBackupFm, getHadoopFileBufferSize, Some(localBackupDir))
 
     // save schema if changed
-    val backupKeySchema = getBackupKeySchema(version)
-    if (backupKeySchema.isEmpty || (keySchema!=null && backupKeySchema.get!=keySchema)) writeRemoteBackupSchema(version, "key", keySchema)
-    val backupValueSchema = getBackupValueSchema(version)
-    if (backupValueSchema.isEmpty || (valueSchema!=null && backupValueSchema.get!=keySchema)) writeRemoteBackupSchema(version, "value", valueSchema)
+    ensureBackupSchemasUpToDate(version)
 
     // update index of backups
     backupList.find{ case (v,(b,k)) => k == backupKey}
@@ -950,6 +949,26 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     remoteBackupFm.list(remoteBackupSchemaPath, new PathFilter {
       override def accept(path: Path): Boolean = path.getName.endsWith(".schema")
     }).map(_.getPath).toSeq
+  }
+
+  /*
+   * update backup schemas if needed
+   */
+  def ensureBackupSchemasUpToDate(version:Long) = {
+    if (!backupKeySchemaUpToDate) {
+      val backupKeySchema = getBackupKeySchema(version)
+      if (backupKeySchema.isEmpty || (keySchema != null && backupKeySchema.get != keySchema)) {
+        writeRemoteBackupSchema(version, "key", keySchema)
+      }
+      backupKeySchemaUpToDate = true
+    }
+    if (!backupValueSchemaUpToDate) {
+      val backupValueSchema = getBackupValueSchema(version)
+      if (backupValueSchema.isEmpty || (valueSchema != null && backupValueSchema.get != keySchema)) {
+        writeRemoteBackupSchema(version, "value", valueSchema)
+      }
+      backupValueSchemaUpToDate = true
+    }
   }
 
   /*
