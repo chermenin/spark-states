@@ -964,7 +964,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
     if (!backupValueSchemaUpToDate) {
       val backupValueSchema = getBackupValueSchema(version)
-      if (backupValueSchema.isEmpty || (valueSchema != null && backupValueSchema.get != keySchema)) {
+      if (backupValueSchema.isEmpty || (valueSchema != null && backupValueSchema.get != valueSchema)) {
         writeRemoteBackupSchema(version, "value", valueSchema)
       }
       backupValueSchemaUpToDate = true
