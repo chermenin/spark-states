@@ -558,7 +558,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
     val t = MiscHelper.measureTime {
       restoreAndOpenDb(version)
-      currentStore = new RocksDbStateStore(version, keySchema, valueSchema, cache)
+      // when exporting state, key/valueSchema is set to null and we need to use the backup key/value schemas
+      currentStore = new RocksDbStateStore(version
+        , Option(keySchema).orElse(getBackupKeySchema(version)).get
+        , Option(valueSchema).orElse(getBackupValueSchema(version)).get, cache)
     }
     logInfo(s"Retrieved $currentStore for $this version $version, took $t seconds")
     // return
