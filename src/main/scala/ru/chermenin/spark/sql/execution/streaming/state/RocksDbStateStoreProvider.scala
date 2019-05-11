@@ -101,6 +101,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   private var options: Options = _
   private var writeOptions: WriteOptions = _
+  private var backupDBOptions: BackupableDBOptions = _
 
   /** Implementation of [[StateStore]] API which is backed by RocksDB */
   class RocksDbStateStore(val version: Long,
@@ -283,7 +284,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         iterator.seekToFirst()
 
         /** Check if has some data */
-        override def hasNext: Boolean = iterator.isValid
+        override def hasNext: Boolean = {
+          if (iterator.isValid) true
+          else {
+            iterator.close // close when end of iterator reached (otherwise there might be native memory leaks...)
+            false
+          }
+        }
 
         /** Get next data from RocksDb */
         override def next(): UnsafeRowPair = {
@@ -433,6 +440,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .setCompactionStyle(CompactionStyle.UNIVERSAL)
       writeOptions = new WriteOptions()
         .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
+      backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
+        .setShareTableFiles(true)
+        .setShareFilesWithChecksum(setShareRocksDbFilesWithChecksum(storeConf.confs))
+        .setSync(true)
 
       // restore backups from remote to local directory
       restoreFromRemoteBackups()
@@ -458,10 +469,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   protected def restoreFromRemoteBackups(): Unit = {
     // copy backups from remote storage and init backup engine
-    val backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
-      .setShareTableFiles(true)
-      .setShareFilesWithChecksum(setShareRocksDbFilesWithChecksum(storeConf.confs))
-      .setSync(true)
     backupList.clear
     if (remoteBackupFm.exists(remoteBackupPath)) {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
@@ -597,6 +604,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         }
         val restoreOptions = new RestoreOptions(false)
         backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
+        restoreOptions.close()
         currentDb = openDb
       }
       logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
@@ -699,9 +707,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     try {
       // cleanup
       if(currentDb!=null) {
-        currentDb.close
+        currentDb.close()
         currentDb = null
       }
+      backupEngine.close()
+      options.close()
+      writeOptions.close()
+      backupDBOptions.close()
+      currentDbStats.close()
       FileUtils.deleteQuietly(new File(localDataDir))
       logInfo(s"Removed local db and backup dir of $this")
     } catch {
