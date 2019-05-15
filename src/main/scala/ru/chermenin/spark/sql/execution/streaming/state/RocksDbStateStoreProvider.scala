@@ -852,7 +852,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         override def accept(path: Path) = nameFilter(path.getName)
       }).toSeq
     } catch {
-      // OI-1298: ignore if remote directory doesn't exist. We will (re-)create it during synchronization of files.
+      // ignore if remote directory doesn't exist. We will (re-)create it during synchronization of files.
       case e:FileNotFoundException =>
         logWarning(s"'${e.getClass.getSimpleName}: ${e.getMessage}' in getRemoteSyncList while getting remote files. Going on with empty remote file list.")
         Seq()
@@ -876,7 +876,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val files2Del = remoteFiles.filter( rf => !localFiles.exists( lf => lf.getPath.getName==rf.getPath.getName ))
       .map(_.getPath)
 
-    // OI-1298: avoid all remote files beeing deleted
+    // avoid all remote files being deleted
     if (files2Copy.isEmpty && remoteFiles.nonEmpty && files2Del.size==remoteFiles.size) {
       logWarning(s"Synchronization of local -> remote would delete all remote files. This is strange and is avoided for now. Local files: ${localFiles.mkString(", ")}. Remote files: ${remoteFiles.mkString(", ")}.")
       (files2Copy, Seq())
