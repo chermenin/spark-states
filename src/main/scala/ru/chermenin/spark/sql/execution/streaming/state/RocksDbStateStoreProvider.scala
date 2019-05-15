@@ -16,14 +16,15 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.{BufferedReader, File, FileNotFoundException, InputStreamReader}
+import java.io._
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, PathFilter}
+import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
@@ -363,6 +364,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var rotatingBackupKey: Boolean = _
   @volatile private var closeDbOnCommit: Boolean = _
   private var remoteBackupPath: Path = _
+  private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
   private var localBackupFs: FileSystem = _
   private var localBackupDir: String = _
@@ -413,6 +415,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // initialize paths
       remoteBackupPath = stateStoreId.storeCheckpointLocation()
+      remoteBackupFs = remoteBackupPath.getFileSystem(hadoopConf)
       localBackupDir = MiscHelper.createLocalDir(localDataDir+"/backup")
       localBackupPath = new Path("file:///"+localBackupDir)
       localBackupFs = localBackupPath.getFileSystem(hadoopConf)
@@ -862,15 +865,22 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }).toSeq
 
     // find local files not existing or different in remote dir
-    val files2Copy = localFiles.flatMap( lf =>
-      remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
-        case None => Some(lf) // not existing -> copy
-        case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> copy
-          if (errorOnChange) logError(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
-          Some(lf)
-        case _ => None // existing and the same -> nothing
-      }
-    ).map(_.getPath)
+    // exception: if this task is a retry, we will copy all local files to avoid later checksum conflicts (otherwise we would need to calculate a checksum and compare between remote & local file)
+    val isTaskRetry = Option(TaskContext.get()).map(_.attemptNumber()>0).getOrElse(false)
+    val files2Copy = if (isTaskRetry) {
+      logInfo("this task is a retry, copying all local files to remote to avoid later rocksdb checksum conflicts")
+      localFiles.map(_.getPath)
+    } else {
+      localFiles.flatMap( lf =>
+        remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
+          case None => Some(lf) // not existing -> copy
+          case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> copy
+            if (errorOnChange) logError(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
+            Some(lf)
+          case _ => None // existing and the same -> nothing
+        }
+      ).map(_.getPath)
+    }
 
     // delete remote files not existing in local dir
     val files2Del = remoteFiles.filter( rf => !localFiles.exists( lf => lf.getPath.getName==rf.getPath.getName ))
