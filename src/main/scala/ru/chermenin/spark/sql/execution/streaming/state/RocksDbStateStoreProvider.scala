@@ -498,8 +498,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // copy shared files in parallel
         remoteBackupFm.list(new Path(remoteBackupPath, "shared")).toSeq
-          .par.foreach(f => copyRemoteToLocalFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false))
-
+          .par.foreach(f => try {
+            copyRemoteToLocalFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false)
+          } catch {
+            // This is to be tolerant in case of inconsistent S3 metadata: the object might be deleted but it's still listed in state
+            // In this case we can catch the FileNotFoundException, log it as error and do not fail the job.
+            // This is no problem for state consistency, as the problematic file should have been deleted. It's no longer needed.
+            case e:FileNotFoundException => logError( s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
+          })
         // copy metadata/private files according to backupList in parallel
         backupList.values.map { case (backupId, backupKey) => s"$backupKey.zip" }.par
           .foreach(filename => try {
@@ -790,9 +796,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     syncRemoteIndex()
 
     // delete old data files in parallel
-    sharedFiles2Del.par.foreach( f =>
-      remoteBackupFm.delete(f)
-    )
+    sharedFiles2Del.par.foreach( f => remoteBackupFm.delete(f))
 
     //return
     backupKey
