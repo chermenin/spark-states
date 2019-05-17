@@ -240,14 +240,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         , TickerType.BLOCK_CACHE_HIT, TickerType.BLOCK_CACHE_MISS
         , TickerType.BYTES_READ, TickerType.BYTES_WRITTEN
       )
-      logInfo(s"rocksdb cache statistics for $this: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
+      logDebug(s"rocksdb cache statistics for $this: "+statsTypes.map( t => s"$t=${currentDbStats.getAndResetTickerCount(t)}" ).mkString(" "))
 
       //log volume statistics
       rocksdbVolumeStatistics = ROCKSDB_VOLUME_PROPERTIES.map{ p =>
         if (p==ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY && isStrictExpire) p -> keyCache.size
         else p -> (if (currentDb!=null) currentDb.getLongProperty(p) else -1l)
       }.toMap
-      logInfo(s"rocksdb volume statistics for $this: "+rocksdbVolumeStatistics.map{ case (k,v) => s"$k=$v"}.mkString(" "))
+      logDebug(s"rocksdb volume statistics for $this: "+rocksdbVolumeStatistics.map{ case (k,v) => s"$k=$v"}.mkString(" "))
     }
 
     /**
@@ -327,7 +327,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       */
     override def metrics: StateStoreMetrics =
       StateStoreMetrics( rocksdbVolumeStatistics.getOrElse(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY,0)
-                       , rocksdbVolumeStatistics.getOrElse(ROCKSDB_SIZE_ALL_MEM_TABLES,0), Map.empty)
+                       , rocksdbVolumeStatistics.getOrElse(ROCKSDB_SIZE_ALL_MEM_TABLES,0) + rocksDbSharedFilesSize
+                       , Map.empty)
 
     /**
       * Whether all updates have been committed
@@ -363,6 +364,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var isStrictExpire: Boolean = _
   @volatile private var rotatingBackupKey: Boolean = _
   @volatile private var closeDbOnCommit: Boolean = _
+  @volatile private var rocksDbSharedFilesSize: Long = 0
   private var remoteBackupPath: Path = _
   private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
@@ -663,7 +665,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     try {
       logDebug(s"starting doMaintenance for $this")
 
-      var sharedFilesSize: Long = 0
       val t = MiscHelper.measureTime {
 
         // flush WAL to SST Files and do manual compaction
@@ -684,7 +685,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         cleanupOldBackups()
 
         // estimate db size
-        sharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath, "shared"))
+        rocksDbSharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath, "shared"))
           .map(_.getLen).sum
 
         // remove cleaned up backups from remote filesystem and backup list
@@ -701,7 +702,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
         //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
       }
-      logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(sharedFilesSize)}")
+      logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(rocksDbSharedFilesSize)}")
     } catch {
       case e: Exception =>
         logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'doMaintenance' of $this")
