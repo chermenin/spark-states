@@ -325,10 +325,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     /**
       * Returns current metrics of the state store
       */
-    override def metrics: StateStoreMetrics =
-      StateStoreMetrics( rocksdbVolumeStatistics.getOrElse(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY,0)
-                       , rocksdbVolumeStatistics.getOrElse(ROCKSDB_SIZE_ALL_MEM_TABLES,0) + rocksDbSharedFilesSize
-                       , Map.empty)
+    override def metrics: StateStoreMetrics = {
+      val estimatedKeyNb: Long = rocksdbVolumeStatistics.getOrElse(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY, 0)
+      val memTableSize: Long = rocksdbVolumeStatistics.getOrElse(ROCKSDB_SIZE_ALL_MEM_TABLES, 0)
+      StateStoreMetrics( estimatedKeyNb, memTableSize + rocksDbSharedFilesSize, Map.empty)
+    }
 
     /**
       * Whether all updates have been committed
