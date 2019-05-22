@@ -366,6 +366,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var rotatingBackupKey: Boolean = _
   @volatile private var closeDbOnCommit: Boolean = _
   @volatile private var rocksDbSharedFilesSize: Long = 0
+  @volatile private var remoteUploadRetries: Int = 1
   private var remoteBackupPath: Path = _
   private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
@@ -415,6 +416,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       this.isStrictExpire = setExpireMode(storeConf.confs)
       this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
       this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
+      this.remoteUploadRetries = setRemoteUploadRetries(storeConf.confs)
 
       // initialize paths
       remoteBackupPath = stateStoreId.storeCheckpointLocation()
@@ -925,8 +927,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   private def getHadoopFileBufferSize = hadoopConf.getInt("io.file.buffer.size", 4096)
 
-  def copyLocalToRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
+  def copyLocalToRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean, retryCnt:Int = 0 ): Unit = try {
     org.apache.hadoop.io.IOUtils.copyBytes( localBackupFs.open(src), remoteBackupFm.createAtomic(dst, overwriteIfPossible), hadoopConf, true)
+  } catch {
+    // For S3 there might be a FileNotFoundException on multi-part uploads which is not handled by retries from S3Client
+    case e:FileNotFoundException if retryCnt<remoteUploadRetries =>
+      logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'copyLocalToRemoteFile' while copying $src to $dst for $this")
+      copyLocalToRemoteFile( src, dst, overwriteIfPossible, retryCnt+1)
   }
 
   def copyRemoteToLocalFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
@@ -1092,6 +1099,10 @@ object RocksDbStateStoreProvider extends Logging {
 
   final val DEFAULT_SHARE_ROCKSDB_FILES_WITH_CHECKSUM: String = "false"
 
+  final val REMOTE_UPLOAD_RETRIES: String = "spark.sql.streaming.stateStore.remoteUpload.retries"
+
+  final val DEFAULT_REMOTE_UPLOAD_RETRIES: String = "1"
+
   final val DUMMY_VALUE: String = ""
 
   private def getJavaTempDir = System.getProperty("java.io.tmpdir").replace('\\', '/')
@@ -1175,6 +1186,12 @@ object RocksDbStateStoreProvider extends Logging {
 
   private def setShareRocksDbFilesWithChecksum(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(SHARE_ROCKSDB_FILES_WITH_CHECKSUM, DEFAULT_SHARE_ROCKSDB_FILES_WITH_CHECKSUM).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setRemoteUploadRetries(conf: Map[String, String]): Int =
+    Try(conf.getOrElse(REMOTE_UPLOAD_RETRIES, DEFAULT_REMOTE_UPLOAD_RETRIES).toInt) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
