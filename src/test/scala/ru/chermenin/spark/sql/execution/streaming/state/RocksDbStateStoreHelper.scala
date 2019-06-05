@@ -177,7 +177,7 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
     val rss = resultParsed("rss").toLong
     Map(
       "linuxMemoryVsz" -> vsz*1024,
-      "linuxMemoryRss" -> rss*1024,
+      "linuxMemoryRss" -> rss*1024
     )
   }
 }

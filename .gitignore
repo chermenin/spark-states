@@ -1,4 +1,6 @@
+**/target
+*.iml
 *.class
 *.log
-**/target/
-.idea/
+.idea
+.settings
