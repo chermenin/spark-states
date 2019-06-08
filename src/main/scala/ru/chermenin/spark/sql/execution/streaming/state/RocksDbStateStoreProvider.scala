@@ -684,14 +684,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         rocksDbSharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath, "shared"))
           .map(_.getLen).sum
 
-        // remove cleaned up backups from remote filesystem and backup list
+        // remove cleaned up backups from backup list
         val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
         val removedBackups = backupList.keys.filter(v => !backupInfoVersions.contains(v))
-        if (!rotatingBackupKey) removedBackups
-          .map(v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
-          .foreach(f => remoteBackupFm.delete(f))
         removedBackups.foreach(backupList.remove)
-        syncRemoteIndex()
         logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
 
         // check free diskspace
