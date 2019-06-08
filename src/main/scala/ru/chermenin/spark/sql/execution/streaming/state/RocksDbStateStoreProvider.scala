@@ -26,7 +26,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, PathFilter}
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.UnsafeRow
+import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.types.{DataType, StructType}
@@ -576,12 +576,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val backupIdRecovery = backupList.get(version).map{ case (b,k) => b }
         .getOrElse(throw new IllegalStateException(s"backup for version $version not found"))
 
-      // check schemas
-      val backupKeySchema = getBackupKeySchema(version)
-      if (backupKeySchema.isDefined && keySchema!=null && backupKeySchema.get!=keySchema) throw new IllegalStateException(s"backup key schema not compatible with current schema. backup: ${backupKeySchema.get.json}, current: ${keySchema.json}")
-      val backupValueSchema = getBackupValueSchema(version)
-      if (backupValueSchema.isDefined && valueSchema!=null && backupValueSchema.get!=valueSchema) throw new IllegalStateException(s"backup value schema not compatible with current schema. backup: ${backupValueSchema.get.json}, current: ${valueSchema.json}")
-
       // close db and restore backup
       val tRestore = MiscHelper.measureTime {
         if (currentDb != null) {
@@ -594,6 +588,29 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         currentDb = openDb
       }
       logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
+
+      // check key schema
+      val backupKeySchema = getBackupKeySchema(version)
+      if (backupKeySchema.isDefined && keySchema!=null && backupKeySchema.get!=keySchema) throw new IllegalStateException(s"backup key schema not compatible with current schema. Schema Evolution for key schema is not rational. backup: ${backupKeySchema.get.json}, current: ${keySchema.json}")
+
+      // check value schema and try schema evolution
+      val backupValueSchema = getBackupValueSchema(version)
+      if (backupValueSchema.isDefined && valueSchema!=null && backupValueSchema.get!=valueSchema) {
+        // create schema evolution projection
+        val projection = SchemaHelper.getSchemaProjection(backupValueSchema.get, valueSchema)
+        logInfo( s"value schema evolution needed for $this. Projection: $projection" )
+        // migrate all records
+        val tMigration = MiscHelper.measureTime {
+          val allKVIter = RocksDbHelper.getIterator(currentDb, backupKeySchema.get, backupValueSchema.get)
+          val unsafeConverter = UnsafeProjection.create(valueSchema) // InternalRow -> UnsafeRow
+          allKVIter.foreach {
+            unsafeRowPair =>
+              val newValueRow = SchemaHelper.applySchemaProjection(unsafeRowPair.value, projection)
+              currentDb.put(unsafeRowPair.key.getBytes, unsafeConverter(newValueRow).getBytes)
+          }
+        }
+        logInfo( s"migrated schema for all values of $this, took $tMigration sec")
+      }
 
       // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
       val newerBackups = (backupList.toSeq.map{ case (v,(b,k)) => (v,b)} ++
@@ -661,7 +678,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
                 val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
                 if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
                   val timeout = groupStateValueRow.getLong(timeoutColIndex)
-                  if (timeout <= currentTime) currentDb.delete(rowPair.key.getBytes)
+                  if (timeout>0 && timeout <= currentTime) currentDb.delete(rowPair.key.getBytes)
                 }
               }
           }
