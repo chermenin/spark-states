@@ -278,39 +278,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def iterator(): Iterator[UnsafeRowPair] = RocksDbStateStoreProvider.this.synchronized {
       MiscHelper.verify(currentDb != null, "iterator can only be created if RocksDB is still opened")
 
-      val stateFromRocksIter: Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
-
-        /** Internal RocksDb iterator */
-        private val iterator = currentDb.newIterator()
-        iterator.seekToFirst()
-
-        /** Check if has some data */
-        override def hasNext: Boolean = {
-          if (iterator.isValid) true
-          else {
-            iterator.close // close when end of iterator reached (otherwise there might be native memory leaks...)
-            false
-          }
-        }
-
-        /** Get next data from RocksDb */
-        override def next(): UnsafeRowPair = {
-          iterator.status()
-
-          val key = new UnsafeRow(keySchema.fields.length)
-          val keyBytes = iterator.key()
-          key.pointTo(keyBytes, keyBytes.length)
-
-          val value = new UnsafeRow(valueSchema.fields.length)
-          val valueBytes = iterator.value()
-          value.pointTo(valueBytes, valueBytes.length)
-
-          iterator.next()
-
-          new UnsafeRowPair(key, value)
-        }
-      }
-
+      val stateFromRocksIter = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
       val stateIter = {
         keyCache.cleanUp()
         val keys = keyCache.asMap().keySet()
@@ -367,6 +335,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var closeDbOnCommit: Boolean = _
   @volatile private var rocksDbSharedFilesSize: Long = 0
   @volatile private var remoteUploadRetries: Int = 1
+  @volatile private var removeExpiredRowsInMaintenance: Boolean = _
+  @volatile private var removeExpiredRowsInMaintenanceColName: String = _
   private var remoteBackupPath: Path = _
   private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
@@ -417,6 +387,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
       this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
       this.remoteUploadRetries = setRemoteUploadRetries(storeConf.confs)
+      this.removeExpiredRowsInMaintenance = setRemoveExpiredRowsInMaintenance(storeConf.confs)
+      this.removeExpiredRowsInMaintenanceColName = setRemoveExpiredRowsInMaintenanceColName(storeConf.confs)
 
       // initialize paths
       remoteBackupPath = stateStoreId.storeCheckpointLocation()
@@ -670,11 +642,32 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       val t = MiscHelper.measureTime {
 
-        // flush WAL to SST Files and do manual compaction
+        // get Db
         val opened = if (currentDb == null) {
           currentDb = openDb
           true
         } else false
+
+        // remove expired Records from state
+        if (removeExpiredRowsInMaintenance) {
+          val currentTime = System.currentTimeMillis()
+          val groupStateValueColIndex = valueSchema.fieldIndex("groupState")
+          val groupStateValueSchema = valueSchema(groupStateValueColIndex).dataType.asInstanceOf[StructType]
+          val timeoutColIndex = groupStateValueSchema.fieldIndex(removeExpiredRowsInMaintenanceColName)
+          val stateIterator = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
+          stateIterator.foreach {
+            rowPair =>
+              if (!rowPair.value.isNullAt(groupStateValueColIndex)) {
+                val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
+                if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
+                  val timeout = groupStateValueRow.getLong(timeoutColIndex)
+                  if (timeout <= currentTime) currentDb.delete(rowPair.key.getBytes)
+                }
+              }
+          }
+        }
+
+        // flush WAL to SST Files and do manual compaction
         currentDb.flush(new FlushOptions().setWaitForFlush(true))
         currentDb.pauseBackgroundWork()
         currentDb.compactRange()
@@ -703,7 +696,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // check free diskspace
         //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
-        //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
+        //logInfo(s"free disk space for $this: "+dirFreeSpace.mkString(", "))
       }
       logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(rocksDbSharedFilesSize)}")
     } catch {
@@ -1103,6 +1096,14 @@ object RocksDbStateStoreProvider extends Logging {
 
   final val DEFAULT_REMOTE_UPLOAD_RETRIES: String = "1"
 
+  final val STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE: String = "spark.sql.streaming.stateStore.removeExpiredRowsInMaintenance"
+
+  final val DEFAULT_STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE: String = "false"
+
+  final val STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE_COL_NAME: String = "spark.sql.streaming.stateStore.removeExpiredRowsInMaintenanceColName"
+
+  final val DEFAULT_STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE_COL_NAME: String = "expirationTstmp"
+
   final val DUMMY_VALUE: String = ""
 
   private def getJavaTempDir = System.getProperty("java.io.tmpdir").replace('\\', '/')
@@ -1192,6 +1193,18 @@ object RocksDbStateStoreProvider extends Logging {
 
   private def setRemoteUploadRetries(conf: Map[String, String]): Int =
     Try(conf.getOrElse(REMOTE_UPLOAD_RETRIES, DEFAULT_REMOTE_UPLOAD_RETRIES).toInt) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setRemoveExpiredRowsInMaintenance(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE, DEFAULT_STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setRemoveExpiredRowsInMaintenanceColName(conf: Map[String, String]): String =
+    Try(conf.getOrElse(STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE_COL_NAME, DEFAULT_STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE_COL_NAME)) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
