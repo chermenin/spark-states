@@ -1,8 +1,11 @@
-package ru.chermenin.spark.sql.execution.streaming.state
+package org.apache.spark.sql
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.types.{DataType, StructField, StructType}
+import org.apache.spark.sql.catalyst.analysis.SimpleAnalyzer
+import org.apache.spark.sql.catalyst.expressions.BindReferences
+import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.types.{DataType, StructType}
 
 object SchemaHelper extends Logging {
 
@@ -10,6 +13,15 @@ object SchemaHelper extends Logging {
     val projection = getSchemaProjection(srcSchema, tgtSchema)
     logInfo( s"projection: $projection" )
     rows.map( row => applySchemaProjection(row, projection))
+  }
+
+  def evaluateExpr(exprCol: Column, in: InternalRow, schema: StructType): Any = {
+    val attributes = schema.toAttributes.map( a => a.withName(a.name))
+    val expr = exprCol.expr
+    val plan = LocalRelation(attributes)
+    val resolvedExpr = SimpleAnalyzer.resolveExpression(expr, plan)
+    val boundExpr = BindReferences.bindReference(resolvedExpr, attributes)
+    boundExpr.eval(in)
   }
 
   sealed trait FieldProjector {

@@ -1,9 +1,10 @@
-package ru.chermenin.spark.sql.execution.streaming.state
+package org.apache.spark.sql
 
+import org.apache.spark.sql.SchemaHelper.SchemaEvolutionException
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.scalatest.FunSuite
-import ru.chermenin.spark.sql.execution.streaming.state.SchemaHelper.SchemaEvolutionException
 
 class SchemaHelperSuite extends FunSuite{
 
@@ -99,5 +100,12 @@ class SchemaHelperSuite extends FunSuite{
     intercept[SchemaEvolutionException]{
       SchemaHelper.schemaEvolution(srcRows.iterator, srcSchema, tgtSchema).toSeq
     }
+  }
+
+  test("evaluate nested expression") {
+    val schema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("b1",StringType))))))
+    val in = InternalRow.fromSeq(Seq(1,InternalRow.fromSeq(Seq(11,"test"))))
+    val eval = SchemaHelper.evaluateExpr( col("nested.a1"), in, schema)
+    assert(eval==11)
   }
 }
