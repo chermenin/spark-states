@@ -691,14 +691,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         rocksDbSharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath, "shared"))
           .map(_.getLen).sum
 
-        // remove cleaned up backups from remote filesystem and backup list
+        // remove cleaned up backups from backup list
         val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
         val removedBackups = backupList.keys.filter(v => !backupInfoVersions.contains(v))
-        if (!rotatingBackupKey) removedBackups
-          .map(v => new Path(remoteBackupPath, s"${backupList(v)._2}.zip"))
-          .foreach(f => remoteBackupFm.delete(f))
         removedBackups.foreach(backupList.remove)
-        syncRemoteIndex()
         logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
 
         // check free diskspace
@@ -791,7 +787,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     val backupKey = getBackupKey(version)
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
-    MiscHelper.compress2Remote(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"), remoteBackupFm, getHadoopFileBufferSize, Some(localBackupDir))
+    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"))
 
     // save schema if changed
     ensureBackupSchemasUpToDate(version)
@@ -844,10 +840,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * update index on remote filesystem
     */
   private def syncRemoteIndex(): Unit = {
-    val indexOutputStream = new java.io.PrintStream(remoteBackupFm.createAtomic( new Path(remoteBackupPath,"index"), true))
-    backupList.toSeq.sortBy(_._1)
-      .foreach{ case (v,(b,k)) => indexOutputStream.println(s"version: $v, backupId: $b, backupKey: $k")}
-    indexOutputStream.close()
+    writeToRemoteFile( new Path(remoteBackupPath,"index"), true ) { os =>
+      val printOs = new java.io.PrintStream(os)
+      backupList.toSeq.sortBy(_._1)
+        .foreach { case (v, (b, k)) => printOs.println(s"version: $v, backupId: $b, backupKey: $k") }
+      printOs.close
+    }
   }
 
   /**
@@ -927,23 +925,36 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   private def getHadoopFileBufferSize = hadoopConf.getInt("io.file.buffer.size", 4096)
 
-  def copyLocalToRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean, retryCnt:Int = 0 ): Unit = try {
-    org.apache.hadoop.io.IOUtils.copyBytes( localBackupFs.open(src), remoteBackupFm.createAtomic(dst, overwriteIfPossible), hadoopConf, true)
-  } catch {
+  def copyLocalToRemoteFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
     // For S3 there might be a FileNotFoundException on multi-part uploads which is not handled by retries from S3Client
-    case e:FileNotFoundException if retryCnt<remoteUploadRetries =>
-      logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'copyLocalToRemoteFile' while copying $src to $dst for $this")
-      copyLocalToRemoteFile( src, dst, overwriteIfPossible, retryCnt+1)
+    MiscHelper.retry( remoteUploadRetries, s"in method 'copyLocalToRemoteFile' while copying $src to $dst for $this", logWarning ) {
+      org.apache.hadoop.io.IOUtils.copyBytes(localBackupFs.open(src), remoteBackupFm.createAtomic(dst, overwriteIfPossible), hadoopConf, true)
+    }
   }
 
   def copyRemoteToLocalFile( src: Path, dst: Path, overwriteIfPossible: Boolean ): Unit = {
     org.apache.hadoop.io.IOUtils.copyBytes( remoteBackupFm.open(src), localBackupFs.create(dst, overwriteIfPossible), hadoopConf, true)
   }
 
+  def compressToRemoteFile(localFiles: Seq[File], archiveFile: Path): Unit = {
+    MiscHelper.retry( remoteUploadRetries, s"in method 'compressToRemoteFile' while compressing $localFiles to $archiveFile for $this", logWarning _ ) {
+      MiscHelper.compress2Remote(localFiles, archiveFile, remoteBackupFm, getHadoopFileBufferSize, Some(localBackupDir))
+    }
+  }
+
+  def writeToRemoteFile(remoteFile: Path, overwriteIfPossible: Boolean)(writerCode: DataOutputStream => Unit): Unit = {
+    MiscHelper.retry( remoteUploadRetries, s"in method 'writeToRemoteFile' while writing to $remoteFile for $this", logWarning ) {
+      val os = remoteBackupFm.createAtomic( remoteFile, overwriteIfPossible)
+      writerCode(os)
+      os.close()
+    }
+  }
+
+
   /**
-    * Get name for local data directory.
-    * As this might be on a persistent volume we include the hostname to avoid conflicts
-    */
+  * Get name for local data directory.
+  * As this might be on a persistent volume we include the hostname to avoid conflicts
+  */
   private def getDataDirName(sparkJobName: Option[String]): String = {
     val sparkJobNamePrep = sparkJobName.filter(!_.isEmpty).map(_+"-").getOrElse("")
     // the state store name is in the current spark version empty (2.4.0)
@@ -1029,9 +1040,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
    * write remote backup schema file
    */
   def writeRemoteBackupSchema(version: Long, typ: String, schema: StructType): Unit = {
-    val os = remoteBackupFm.createAtomic( new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(version,typ)), false)
-    os.writeBytes(schema.prettyJson)
-    os.close()
+    writeToRemoteFile( new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(version,typ)), false){ os =>
+      os.writeBytes(schema.prettyJson)
+    }
     logInfo(s"created new backup $typ schema for version $version: ${schema.json}")
   }
 
