@@ -512,7 +512,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             // This is to be tolerant in case of inconsistent S3 metadata: the object might be deleted but it's still listed in state
             // In this case we can catch the FileNotFoundException, log it as error and do not fail the job.
             // This is no problem for state consistency, as the problematic file should have been deleted. It's no longer needed.
-            case e:FileNotFoundException => logError( s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
+            case e:FileNotFoundException => logWarning( s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
           })
         // copy metadata/private files according to backupList in parallel
         backupList.values.map { case (backupId, backupKey) => s"$backupKey.zip" }.par
