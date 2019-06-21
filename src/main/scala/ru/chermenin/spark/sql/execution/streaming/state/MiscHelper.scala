@@ -137,7 +137,7 @@ object MiscHelper {
   def retry(retryCntMax: Int, errText: String, logFunc: ( => String) => Unit, retryCnt: Int = 0 )(code: => Unit): Unit = try {
     code
   } catch {
-    case e:Exception if retryCnt<retryCnt =>
+    case e:Exception if retryCnt < retryCntMax =>
       logFunc(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' $errText")
       retry( retryCntMax, errText, logFunc, retryCnt+1)(code)
   }
