@@ -93,6 +93,26 @@ class SchemaHelperSuite extends FunSuite{
     assert(tgtRows==tgtRowsExpected)
   }
 
+
+  test("nested schema, new field with default value") {
+    val srcSchema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("b1",StringType))))))
+    val srcRows = Seq(IRow(1, IRow(11,"test")))
+    val tgtSchema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("c1",IntegerType))))))
+    val tgtRows = SchemaHelper.schemaEvolution(srcRows.iterator, srcSchema, tgtSchema, Map("nested.c1" -> expr("(nested.a1 + 9) - a"))).toSeq
+    val tgtRowsExpected = Seq(IRow(1, IRow(11, 19)))
+    tgtRows.foreach(println)
+    assert(tgtRows==tgtRowsExpected)
+  }
+
+  test("nested schema, new field with default value, wrong type") {
+    val srcSchema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("b1",StringType))))))
+    val srcRows = Seq(IRow(1, IRow(11,"test")))
+    val tgtSchema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("c1",StringType))))))
+    intercept[AssertionError]{
+      SchemaHelper.schemaEvolution(srcRows.iterator, srcSchema, tgtSchema, Map("nested.c1" -> expr("(nested.a1 + 9) - a")) ).toSeq
+    }
+  }
+
   test("nested schema, unsupported data type change") {
     val srcSchema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("b1",StringType))))))
     val srcRows = Seq(IRow(1,"test"))
@@ -105,7 +125,8 @@ class SchemaHelperSuite extends FunSuite{
   test("evaluate nested expression") {
     val schema = StructType(Seq(StructField("a",IntegerType),StructField("nested",StructType(Seq(StructField("a1",IntegerType),StructField("b1",StringType))))))
     val in = InternalRow.fromSeq(Seq(1,InternalRow.fromSeq(Seq(11,"test"))))
-    val eval = SchemaHelper.evaluateExpr( col("nested.a1"), in, schema)
+    val expr = SchemaHelper.prepareExpr( col("nested.a1"), schema)
+    val eval = expr.eval(in)
     assert(eval==11)
   }
 }

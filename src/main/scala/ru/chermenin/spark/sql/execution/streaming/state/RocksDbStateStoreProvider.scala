@@ -26,7 +26,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, PathFilter}
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.SchemaHelper
+import org.apache.spark.sql.{SchemaHelper, functions}
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.state._
@@ -598,7 +598,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val backupValueSchema = getBackupValueSchema(version)
       if (backupValueSchema.isDefined && valueSchema!=null && backupValueSchema.get!=valueSchema) {
         // create schema evolution projection
-        val projection = SchemaHelper.getSchemaProjection(backupValueSchema.get, valueSchema)
+        val defaultValues = storeConf.confs.filterKeys(_.startsWith(STATE_SCHEMAEVOLUTION_DEFAULTVALUE_PREFIX))
+          .map{ case (k,v) => (k.stripPrefix(STATE_SCHEMAEVOLUTION_DEFAULTVALUE_PREFIX+"."), functions.expr(v))}
+        val projection = SchemaHelper.getSchemaProjection(backupValueSchema.get, valueSchema, defaultValues)
         logInfo( s"value schema evolution needed for $this. Projection: $projection" )
         // migrate all records
         val tMigration = MiscHelper.measureTime {
@@ -1117,6 +1119,8 @@ object RocksDbStateStoreProvider extends Logging {
   final val STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE_COL_NAME: String = "spark.sql.streaming.stateStore.removeExpiredRowsInMaintenanceColName"
 
   final val DEFAULT_STATE_REMOVE_EXPIRED_ROWS_IN_MAINTENANCE_COL_NAME: String = "expirationTstmp"
+
+  final val STATE_SCHEMAEVOLUTION_DEFAULTVALUE_PREFIX: String = "spark.sql.streaming.stateStore.schemaEvolution.defaultValue"
 
   final val DUMMY_VALUE: String = ""
 
