@@ -20,14 +20,15 @@ version := "0.1"
 
 crossScalaVersions := Seq("2.11.12", "2.12.7")
 
-val sparkVersion = "2.4.0"
+val sparkVersion = "2.4.3"
+val rocksDbVersion = "5.18.3"
 
 libraryDependencies ++= Seq(
 
   // general dependencies
   "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
   "org.apache.spark" %% "spark-streaming" % sparkVersion % "provided",
-  "org.rocksdb" % "rocksdbjni" % "5.17.2",
+  "org.rocksdb" % "rocksdbjni" % rocksDbVersion,
 
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
