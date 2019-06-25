@@ -368,7 +368,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     def initStateStore(path: String): StateStore =
       new RocksDbStateStore(version, path, keySchema, valueSchema, localSnapshots, createCache(ttlSec))
 
-    val stateStore = versions.sorted(Ordering.Long.reverse)
+    val stateStore = versions.sorted(Ordering.Long.reverse).toStream
       .map(version => Try(loadDb(version)).map(initStateStore))
       .find(_.isSuccess).map(_.get)
       .getOrElse(initStateStore(getTempDir(getTempPrefix(), s".$version")))
