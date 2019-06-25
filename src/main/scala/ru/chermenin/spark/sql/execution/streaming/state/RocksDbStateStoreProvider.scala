@@ -184,7 +184,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       */
     override def getRange(start: Option[UnsafeRow], end: Option[UnsafeRow]): Iterator[UnsafeRowPair] = {
       verify(state == State.Updating, "Cannot getRange from already committed or aborted state")
-      iterator()
+      val readOptions = new ReadOptions()
+      if (start.isDefined) readOptions.setIterateLowerBound(new Slice(start.get.getBytes))
+      if (end.isDefined) readOptions.setIterateUpperBound(new Slice(end.get.getBytes))
+      iterator(Some(readOptions))
     }
 
     /**
@@ -234,11 +237,22 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Get an iterator of all the store data.
       * This can be called only after committing all the updates made in the current thread.
       */
-    override def iterator(): Iterator[UnsafeRowPair] = {
+    override def iterator(): Iterator[UnsafeRowPair] = iterator(None)
+
+    /**
+      * Get an iterator using additional options for reading.
+      *
+      * @param readOptions additional options
+      * @return iterator of key-values pairs
+      */
+    def iterator(readOptions: Option[ReadOptions]): Iterator[UnsafeRowPair] = {
       val stateFromRocksIter: Iterator[UnsafeRowPair] = new Iterator[UnsafeRowPair] {
 
         /** Internal RocksDb iterator */
-        private val iterator = store.newIterator()
+        private val iterator: RocksIterator = readOptions match {
+          case Some(readOpts) => store.newIterator(readOpts)
+          case _ => store.newIterator()
+        }
         iterator.seekToFirst()
 
         /** Check if has some data */

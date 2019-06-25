@@ -27,7 +27,7 @@ libraryDependencies ++= Seq(
   // general dependencies
   "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
   "org.apache.spark" %% "spark-streaming" % sparkVersion % "provided",
-  "org.rocksdb" % "rocksdbjni" % "5.17.2",
+  "org.rocksdb" % "rocksdbjni" % "6.0.1",
 
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
