@@ -431,7 +431,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
 
       // initialize new RocksdbLogger with Warn level for now
-      val rocksDbLogger = new org.rocksdb.Logger(new Options().setInfoLogLevel(InfoLogLevel.WARN_LEVEL)) {
+      val rocksDbLogger = new org.rocksdb.Logger(new Options().setInfoLogLevel(InfoLogLevel.ERROR_LEVEL)) {
         def log( logLevel: InfoLogLevel, logMsg: String ): Unit = {
           if (logLevel == InfoLogLevel.ERROR_LEVEL) logError(logMsg)
           else if (logLevel == InfoLogLevel.WARN_LEVEL) logWarning(logMsg)
