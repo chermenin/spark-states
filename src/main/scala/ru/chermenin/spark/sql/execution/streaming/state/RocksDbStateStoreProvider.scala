@@ -22,6 +22,7 @@ import java.util.zip.ZipInputStream
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.commons.io.FileUtils
+import org.apache.commons.io.output.TeeOutputStream
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, PathFilter}
 import org.apache.spark.TaskContext
@@ -428,9 +429,21 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
       remoteBackupSchemaPath = new Path(remoteBackupPath, "schema")
 
+
+      // initialize new RocksdbLogger with Warn level for now
+      val rocksDbLogger = new org.rocksdb.Logger(new Options().setInfoLogLevel(InfoLogLevel.WARN_LEVEL)) {
+        def log( logLevel: InfoLogLevel, logMsg: String ): Unit = {
+          if (logLevel == InfoLogLevel.ERROR_LEVEL) logError(logMsg)
+          else if (logLevel == InfoLogLevel.WARN_LEVEL) logWarning(logMsg)
+          else if (logLevel == InfoLogLevel.INFO_LEVEL) logInfo(logMsg)
+          else logDebug(logMsg)
+        }
+      }
+
       // initialize empty database
       currentDbStats.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS)
       options = new Options()
+        .setLogger(rocksDbLogger) // set custom logger
         .setStatistics(currentDbStats)
         .setCreateIfMissing(true)
         .setWriteBufferSize(setWriteBufferSizeMb(storeConf.confs) * SizeUnit.MB)
@@ -446,9 +459,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
         .setCompressionType(setCompressionType(storeConf.confs))
         .setCompactionStyle(CompactionStyle.UNIVERSAL)
+        //.setParanoidChecks(false) // use default for now
+        //.setForceConsistencyChecks(false) // use default for now
+        //.setParanoidFileChecks(false) // use default for now
       writeOptions = new WriteOptions()
         .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
       backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
+        //.setInfoLog(rocksDbLogger) // this crashes
         .setShareTableFiles(true)
         .setShareFilesWithChecksum(setShareRocksDbFilesWithChecksum(storeConf.confs))
         .setSync(true)
@@ -519,7 +536,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           .foreach(filename => try {
             MiscHelper.decompressFromRemote(new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
           } catch {
-            case e: FileNotFoundException => logWarning(s"{e.getMessage} when copying metadata/private files from remote backup in method 'init'")
+            case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup $filename in method 'init'")
           })
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
 
@@ -555,6 +572,30 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       currentDb.close()
       currentDb = null
     }
+  }
+
+  /**
+    * This is used for external inspection:
+    * trigger a refresh of the database
+    */
+  def refreshDb(): RocksDB = {
+    if (currentDb != null) {
+      currentDb.close()
+    }
+    currentDb = openDb
+    currentDb
+  }
+
+  /**
+    * This is used for external inspection:
+    * trigger a refresh of the backup engine
+    */
+  def refreshBackupEngine(): BackupEngine = {
+    if (backupEngine!=null) {
+      backupEngine.close()
+    }
+    backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
+    backupEngine
   }
 
   /**
@@ -841,10 +882,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def syncRemoteIndex(): Unit = {
     writeToRemoteFile( new Path(remoteBackupPath,"index"), true ) { os =>
-      val printOs = new java.io.PrintStream(os)
+      val baOs = new ByteArrayOutputStream()
+      val printOs = new PrintStream(baOs)
       backupList.toSeq.sortBy(_._1)
         .foreach { case (v, (b, k)) => printOs.println(s"version: $v, backupId: $b, backupKey: $k") }
-      printOs.close
+      // this is for debugging consistency problems with S3
+      logInfo("new remote index file content: "+baOs.toString().replace(System.getProperty("line.separator"), "; "))
+      printOs.close()
+      os.write(baOs.toByteArray)
     }
   }
 
