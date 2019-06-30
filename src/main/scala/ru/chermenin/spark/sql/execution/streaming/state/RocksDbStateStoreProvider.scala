@@ -524,15 +524,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
             rotatingKeysCleanupNeeded = true
             logInfo(s"legacy rotating key backup layout detected -> converted to normal layout for $this: " + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
 
-          // normal backup layout -> copy all files
+          // normal backup layout -> copy latest file per version
           case Failure(e) =>
-            remoteBackupFm.list(remoteBackupPath).toSeq.par
-            .filter( f => !f.isDirectory && f.getPath.getName.endsWith(".zip"))
-            .foreach(f => try {
-              MiscHelper.decompressFromRemote(f.getPath, localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
-            } catch {
-              case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup ${f.getPath.getName} in method 'init'")
-            })
+            getRemoteBackupInfo
+              .groupBy( _._1 ) // group by version
+              .values.map( fs => fs.maxBy(_._2)._3) // get entry with latest timestamp per group
+              .par.foreach(f => try {
+                MiscHelper.decompressFromRemote(f.getPath, localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
+              } catch {
+                case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup ${f.getPath.getName} in method 'init'")
+              })
         }
 
         // copy shared files in parallel
@@ -563,6 +564,15 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       currentDb.close()
       currentDb = null
     }
+  }
+
+  def getRemoteBackupInfo: Seq[(Long, Long, FileStatus)] = {
+    remoteBackupFm.list(remoteBackupPath).toSeq
+      .filter( f => !f.isDirectory && f.getPath.getName.matches("[0-9_]*.zip"))
+      .map{ f => // extract version and timestamp
+        val Array(v, tstmp) = f.getPath.getName.stripSuffix(".zip").split('_')
+        (v.toLong, tstmp.toLong,f)
+      }
   }
 
   def getBackupInfo: Map[Long,Int] = backupEngine.getBackupInfo.asScala.map( b => (b.appMetadata.toLong, b.backupId())).toMap
@@ -802,7 +812,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // save metadata & private files as zip archive
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
-    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$version.zip"))
+    val tstmp = System.currentTimeMillis()
+    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"${version}_$tstmp.zip"))
 
     // save schema if changed
     ensureBackupSchemasUpToDate(version)
@@ -827,15 +838,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   private def cleanupLocalBackups(backupInfos: Seq[(Long,Int)]): Unit = {
     // delete local backup versions
-    backupInfos.map{ case (v,b) => b}.distinct.foreach( deleteBackup )
+    backupInfos.map{ case (v,b) => b}.distinct.foreach( deleteLocalBackup )
     backupEngine.garbageCollect()
   }
 
   private def cleanupRemoteBackupVersions(backupInfos: Seq[(Long,Int)]): Unit = {
-    // delete unused remote versions
-    backupInfos.map { case (v, b) => v }.distinct.par
-      .foreach{ v =>
-        remoteBackupFm.delete(new Path(remoteBackupPath, s"$v.zip"))
+    // search and delete remote version files
+    getRemoteBackupInfo
+      .filter{ case (v,tstmp,f) => backupInfos.exists( _._1 == v )}
+      .par.foreach{ case (v,tstmp,f) =>
+        remoteBackupFm.delete( f.getPath )
       }
   }
 
@@ -850,7 +862,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /**
     * delete backup from backup engine
     */
-  private def deleteBackup(backupId:Int): Unit = {
+  private def deleteLocalBackup(backupId:Int): Unit = {
     Try(backupEngine.deleteBackup(backupId)) match {
       case Failure(e) => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' while deleting backup with backupId $backupId for $this")
       case _ => Unit
