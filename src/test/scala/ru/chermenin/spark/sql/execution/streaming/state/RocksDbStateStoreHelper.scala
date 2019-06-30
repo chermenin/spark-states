@@ -95,7 +95,7 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
     backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
   }
 
-  def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Int): Unit = {
+  def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Long): Unit = {
 
     // delete local backup
     val backupEngineMethod = PrivateMethod[BackupEngine]('backupEngine)
@@ -105,10 +105,10 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
       .backupId
     backupEngine.deleteBackup(backupId)
 
-    // remove from index
-    val backupList = getProviderPrivateProperty[mutable.HashMap[Long,(Int,String)]](provider, 'backupList)
-    backupList.remove(version)
-    getProviderPrivateProperty[Unit](provider, 'syncRemoteIndex) // call this as a function
+    // remove remote
+    val cleanupRemoteBackupVersionsMethod = PrivateMethod[Unit]('cleanupRemoteBackupVersions)
+    provider invokePrivate cleanupRemoteBackupVersionsMethod( Seq((version,backupId)))
+
     logInfo( s"corrupted snapshot version $version, backupId $backupId")
   }
 
