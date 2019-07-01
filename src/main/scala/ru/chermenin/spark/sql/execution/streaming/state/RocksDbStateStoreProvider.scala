@@ -18,11 +18,9 @@ package ru.chermenin.spark.sql.execution.streaming.state
 
 import java.io._
 import java.util.concurrent.TimeUnit
-import java.util.zip.ZipInputStream
 
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.commons.io.FileUtils
-import org.apache.commons.io.output.TeeOutputStream
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path, PathFilter}
 import org.apache.spark.TaskContext
@@ -364,13 +362,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var localWalDataDir: String = _
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
-  @volatile private var rotatingBackupKey: Boolean = _
   @volatile private var closeDbOnCommit: Boolean = _
-  @volatile private var rocksDbSharedFilesSize: Long = 0
   @volatile private var remoteUploadRetries: Int = 1
+  @volatile private var rocksDbSharedFilesSize: Long = 0 // store shared file size metric
   private var remoteBackupPath: Path = _
   private var remoteBackupFs: FileSystem = _
   private var localBackupPath: Path = _
+  private var localBackupSharedPath: Path = _
   private var localBackupFs: FileSystem = _
   private var localBackupDir: String = _
   private var localDbDir: String = _
@@ -378,13 +376,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private val currentDbStats: Statistics = new Statistics()
   private var currentStore: RocksDbStateStore = _
   private var backupEngine: BackupEngine = _
-  private var backupList: mutable.Map[Long,(Int,String)] = mutable.HashMap()
-  private var remoteCleanupList: mutable.ArrayBuffer[Path] = mutable.ArrayBuffer()
   private var remoteBackupFm: CheckpointFileManager = _
   private var remoteBackupSchemaPath: Path = _
+  private var remoteBackupSharedPath: Path = _
   private var backupSchemas: Seq[(Long,String,StructType)] = Seq()
   private var backupKeySchemaUpToDate = false
   private var backupValueSchemaUpToDate = false
+  private var rotatingKeysCleanupNeeded = false
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -415,7 +413,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       this.localWalDataDir = MiscHelper.createLocalDir( setLocalWalDir(storeConf.confs)+"/"+getDataDirName(Option(hadoopConf.get("spark.app.name"))))
       this.ttlSec = setTTL(storeConf.confs)
       this.isStrictExpire = setExpireMode(storeConf.confs)
-      this.rotatingBackupKey = setRotatingBackupKey(storeConf.confs)
       this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
       this.remoteUploadRetries = setRemoteUploadRetries(storeConf.confs)
 
@@ -424,13 +421,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       remoteBackupFs = remoteBackupPath.getFileSystem(hadoopConf)
       localBackupDir = MiscHelper.createLocalDir(localDataDir+"/backup")
       localBackupPath = new Path("file:///"+localBackupDir)
+      localBackupSharedPath = new Path( localBackupPath, "shared_checksum" )
       localBackupFs = localBackupPath.getFileSystem(hadoopConf)
       localDbDir = MiscHelper.createLocalDir(localDataDir+"/db")
       remoteBackupFm = CheckpointFileManager.create(remoteBackupPath, hadoopConf)
       remoteBackupSchemaPath = new Path(remoteBackupPath, "schema")
+      remoteBackupSharedPath = new Path(remoteBackupPath, "shared")
 
-
-      // initialize new RocksdbLogger with Warn level for now
+      // initialize new RocksDbLogger with Error level for now
       val rocksDbLogger = new org.rocksdb.Logger(new Options().setInfoLogLevel(InfoLogLevel.ERROR_LEVEL)) {
         def log( logLevel: InfoLogLevel, logMsg: String ): Unit = {
           if (logLevel == InfoLogLevel.ERROR_LEVEL) logError(logMsg)
@@ -467,7 +465,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
         //.setInfoLog(rocksDbLogger) // this crashes
         .setShareTableFiles(true)
-        .setShareFilesWithChecksum(setShareRocksDbFilesWithChecksum(storeConf.confs))
+        .setShareFilesWithChecksum(true)
         .setSync(true)
 
       // restore backups from remote to local directory
@@ -475,7 +473,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // read and check state schemas
       val backupSchemaFiles = getRemoteBackupSchemaFiles
-      val latestVersion = Try(backupList.keys.max).getOrElse(-1l)
+      val latestVersion = Try(getBackupInfo.keys.max).getOrElse(-1l)
       backupSchemas = backupSchemaFiles.flatMap( parseBackupSchemaFile(latestVersion))
       val latestBackupKeySchema = getBackupKeySchema(latestVersion)
       val latestBackupValueSchema = getBackupValueSchema(latestVersion)
@@ -494,78 +492,78 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   protected def restoreFromRemoteBackups(): Unit = {
     // copy backups from remote storage and init backup engine
-    backupList.clear
     if (remoteBackupFm.exists(remoteBackupPath)) {
       logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
 
-      // cleanup possible existing backup files
+      // cleanup possible existing local backup files
       // Note: deleting localBackupDir on Windows results in permission errors in unit tests... we do the cleanup only for linux for now
       if (!MiscHelper.isWindowsOS) {
         FileUtils.deleteQuietly(new File(localBackupDir))
       }
 
-      // read index file into backupList, otherwise extract backup information from archive files
-      val backupList = Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
-        case Success(backupListInputStream) =>
-          val backupListReader = new BufferedReader(new InputStreamReader(backupListInputStream))
-          val backupListParsed = backupListReader.lines.iterator.asScala.toArray.map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
-          backupListInputStream.close() // it is tricky that input stream isn't closed at all or even twice... iterator.toArray / manual close seems to be proper
-          backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-        case Failure(_: FileNotFoundException) =>
-          logWarning(s"index file not found on remote filesystem for $this. Extracted the backup list from archive files.")
-          getBackupListFromRemoteFiles
-        case Failure(e) => throw e
-      }
-      logDebug(s"backup list for $this: " + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
-
       // load files
       val t = MiscHelper.measureTime {
 
-        // copy shared files in parallel
-        remoteBackupFm.list(new Path(remoteBackupPath, "shared")).toSeq
-          .par.foreach(f => try {
-            copyRemoteToLocalFile(f.getPath, new Path(localBackupPath, s"shared/${f.getPath.getName}"), false)
-          } catch {
-            // This is to be tolerant in case of inconsistent S3 metadata: the object might be deleted but it's still listed in state
-            // In this case we can catch the FileNotFoundException, log it as error and do not fail the job.
-            // This is no problem for state consistency, as the problematic file should have been deleted. It's no longer needed.
-            case e:FileNotFoundException => logWarning( s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
-          })
-        // copy metadata/private files according to backupList in parallel
-        backupList.values.map { case (backupId, backupKey) => s"$backupKey.zip" }.par
-          .foreach(filename => try {
-            MiscHelper.decompressFromRemote(new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
-          } catch {
-            case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup $filename in method 'init'")
-          })
-        backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
+        // copy metadata/private files
+        Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
 
-        // cleanup potential superfluous backups in backup engine compared to index/backuplist
-        if (backupList.size > 0) {
-          backupEngine.getBackupInfo.asScala
-            .filter(_.appMetadata().toLong > backupList.keys.max)
-            .foreach { backupInfo =>
-              deleteBackup(backupInfo.backupId)
-              logInfo(s"deleted superfluous backup for version ${backupInfo.appMetadata}, backupId ${backupInfo.backupId} from backup engine for $this")
-            }
+          // if legacy rotating key backup layout -> convert to normal layout
+          // TODO: remove legacy mode after migration
+          case Success(backupListInputStream) =>
+            // copy metadata/private files according to backupList in parallel
+            val backupListReader = new BufferedReader(new InputStreamReader(backupListInputStream))
+            val backupListParsed = backupListReader.lines.iterator.asScala.toArray.map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
+            backupListInputStream.close() // it is tricky that input stream isn't closed at all or even twice... iterator.toArray / manual close seems to be proper
+            val backupList = backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
+            backupList.values.map{ case (backupId, backupKey) => s"$backupKey.zip" }.par
+              .foreach(filename => try {
+                MiscHelper.decompressFromRemote(new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
+              } catch {
+                case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup $filename in method 'init'")
+              })
+            rotatingKeysCleanupNeeded = true
+            logInfo(s"legacy rotating key backup layout detected -> converted to normal layout for $this: " + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
+
+          // normal backup layout -> copy latest file per version
+          case Failure(e) =>
+            getRemoteBackupInfo
+              .groupBy( _._1 ) // group by version
+              .values.map( fs => fs.maxBy(_._2)._3) // get entry with latest timestamp per group
+              .par.foreach(f => try {
+                MiscHelper.decompressFromRemote(f.getPath, localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
+              } catch {
+                case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup ${f.getPath.getName} in method 'init'")
+              })
         }
-        cleanupOldBackups()
 
-        // check backupIds between backup engine and index/backuplist
-        backupEngine.getBackupInfo.asScala
-          .foreach { backupEngineEntry =>
-            val version = backupEngineEntry.appMetadata.toLong
-            val backupListEntry = backupList.get(version)
-            if (backupListEntry.isEmpty) logWarning(s"missing backup in index/backuplist for version $version of $this")
-            else if (backupListEntry.get._1 != backupEngineEntry.backupId) logWarning(s"conflicting backupId's for version $version of $this. index/backuplist has backupId ${backupListEntry.get._1}, backupEngine has backupId ${backupEngineEntry.backupId}")
-          }
+        // copy shared files in parallel
+        try {
+          remoteBackupFm.list(remoteBackupSharedPath).toSeq.par
+            .filter(f => !f.isDirectory && f.getPath.getName.endsWith(".sst"))
+            .foreach(f => try {
+              // shared files with checksum must be copied into a different folder
+              // TODO: remove legacy mode after migration
+              val localSharedBackupPath = if (f.getPath.getName.matches("[0-9]*_[0-9]*_[0-9]*.sst")) new Path(localBackupSharedPath, f.getPath.getName)
+              else new Path(localBackupPath, s"shared/${f.getPath.getName}") // legacy shared file location...
+              copyRemoteToLocalFile(f.getPath, localSharedBackupPath, true)
+            } catch {
+              // This is to be tolerant in case of inconsistent S3 metadata: the object might be deleted but it's still listed in state
+              // In this case we can catch the FileNotFoundException, log it as error and do not fail the job.
+              // This is no problem for state consistency, as the problematic file should have been deleted. It's no longer needed.
+              case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
+            })
+        } catch {
+          case e: FileNotFoundException => logInfo(s"$remoteBackupSharedPath doesn't yet exist. It will be created on commit.")
+        }
+
+        // open backup engine
+        backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       }
-      this.backupList ++= backupList // copy local backup list variable to state variable if everything went smooth.
-      logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs")
+      logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs, existing backups are "+getBackupInfoStr)
 
     } else {
       logDebug(s"initializing state backup at $remoteBackupPath for $this")
-      remoteBackupFm.mkdirs( new Path(remoteBackupPath, "shared"))
+      remoteBackupFm.mkdirs(remoteBackupSharedPath)
       backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       currentDb = openDb
       createBackup(0L)
@@ -573,6 +571,22 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       currentDb = null
     }
   }
+
+  def getRemoteBackupInfo: Seq[(Long, Long, FileStatus)] = {
+    remoteBackupFm.list(remoteBackupPath).toSeq
+      .filter( f => !f.isDirectory && f.getPath.getName.matches("[0-9_\\.]*.zip"))
+      .map{ f => // extract version and timestamp
+        // filename format is "<version>_<tstampMs>.zip" or "<version>_<contextId>_<tstampMs>.zip"
+        val parsedName = f.getPath.getName.stripSuffix(".zip").split('_')
+        assert(parsedName.length >= 2, s"Filename format is strange for ${f.getPath}")
+        val version = parsedName.head.toLong
+        val tstamp = parsedName.last.toLong
+        (version, tstamp,f)
+      }
+  }
+
+  def getBackupInfo: Map[Long,Int] = backupEngine.getBackupInfo.asScala.map( b => (b.appMetadata.toLong, b.backupId())).toMap
+  def getBackupInfoStr: String = getBackupInfo.toSeq.sortBy(_._1).map( i => s"v=${i._1},b=${i._2}").mkString("; ")
 
   /**
     * This is used for external inspection:
@@ -614,9 +628,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     require(version >= 0, "Version cannot be less than 0")
 
     // try restoring remote backups if version doesnt exists in local backups. This might happen if execution of a partition changes executor.
-    if (!backupList.contains(version)) {
+    if (!getBackupInfo.contains(version)) {
       restoreFromRemoteBackups()
-      if (!backupList.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list (${backupList.keys.toSeq.sorted.mkString(",")})")
+      if (!getBackupInfo.contains(version)) throw new IllegalStateException(s"Can not find version $version in backup list ($getBackupInfoStr)")
     }
     val t = MiscHelper.measureTime {
       restoreAndOpenDb(version)
@@ -642,8 +656,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     } else {
 
       // get infos about backup to recover
-      val backupIdRecovery = backupList.get(version).map{ case (b,k) => b }
-        .getOrElse(throw new IllegalStateException(s"backup for version $version not found"))
+      val backupIdRecovery = getBackupInfo
+        .getOrElse( version, throw new IllegalStateException(s"backup for version $version not found"))
 
       // check schemas
       val backupKeySchema = getBackupKeySchema(version)
@@ -663,34 +677,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         currentDb = openDb
       }
       logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
-
-      // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
-      val newerBackups = (backupList.toSeq.map{ case (v,(b,k)) => (v,b)} ++
-          backupEngine.getBackupInfo.asScala.map( i => (i.appMetadata().toLong,i.backupId))
-        ).filter{ case (v,b) => v > version}
-      val tCleanup = MiscHelper.measureTime {
-        remoteCleanupList.clear
-        newerBackups.map{ case (v,b) => b}.distinct.foreach( deleteBackup )
-        newerBackups.map{ case (v,b) => v}.distinct.foreach { v =>
-          backupList.remove(v)
-          remoteCleanupList += new Path(remoteBackupPath, s"${getBackupKey(v)}.zip")
-        }
-
-        backupEngine.garbageCollect()
-
-        // delete unused shared data files to avoid later conflicts
-        val (_,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
-        if(sharedFiles2Del.nonEmpty) logInfo(s"found ${sharedFiles2Del.size} unused remote files to delete for $this")
-        remoteCleanupList ++= sharedFiles2Del
-
-        // delete future schema versions to avoid later conflicts
-        backupSchemas.filter(_._1>version).foreach{ case (v,t,_) =>
-          val path = new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(v,t))
-          logInfo(s"found future schema version to delete for $this")
-          remoteCleanupList += path
-        }
-      }
-      if (newerBackups.nonEmpty) logInfo(s"deleted newer local backups versions ${newerBackups.map(_._1).distinct.sorted.mkString(", ")} for $this, took $tCleanup secs")
     }
   }
 
@@ -725,18 +711,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           currentDb = null
         }
 
-        // cleanup old backups
-        cleanupOldBackups()
-
         // estimate db size
-        rocksDbSharedFilesSize = localBackupFs.listStatus(new Path(localBackupPath, "shared"))
+        rocksDbSharedFilesSize = localBackupFs.listStatus(localBackupSharedPath)
           .map(_.getLen).sum
-
-        // remove cleaned up backups from backup list
-        val backupInfoVersions = backupEngine.getBackupInfo.asScala.map(_.appMetadata().toLong)
-        val removedBackups = backupList.keys.filter(v => !backupInfoVersions.contains(v))
-        removedBackups.foreach(backupList.remove)
-        logDebug(s"backup list for $this after doMaintenance: ${backupList.toSeq.sortBy(_._1).mkString(", ")}")
 
         // check free diskspace
         //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
@@ -783,7 +760,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /**
     * creates a backup of the current database for the version given
     */
-  private def createBackup(version: Long): Unit = {
+  private def createBackup(version: Long): Int = {
+
+    // delete potential newer backups to avoid diverging data versions. See also comment for [[BackupEngine.restoreDbFromBackup]]
+    val newerBackups = getBackupInfo.toSeq.filter{ case (v,b) => v > version}
+    if (newerBackups.nonEmpty) {
+      cleanupLocalBackups(newerBackups)
+      cleanupRemoteBackupVersions(newerBackups)
+      cleanupFutureRemoteSchemas(version)
+      logInfo(s"deleted newer backup versions ${newerBackups.map(_._1).distinct.sorted.mkString(", ")} for $this")
+    }
 
     // create local backup
     val tBackup = MiscHelper.measureTime {
@@ -794,11 +780,23 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logDebug(s"created backup for $this version $version with backupId $backupId, took $tBackup secs")
 
     // sync to remote filesystem
-    var backupKey = ""
     val tSync = MiscHelper.measureTime {
-      backupKey = syncRemoteBackup(backupId, version)
+      syncRemoteBackup(backupId, version)
     }
-    logDebug(s"synced $this version $version backupId $backupId to remote filesystem with backupKey $backupKey, took $tSync secs")
+    logDebug(s"synced $this version $version backupId $backupId to remote filesystem, took $tSync secs")
+
+    // cleanup legacy rotating key layout
+    // TODO: cleanup after migration
+    if (rotatingKeysCleanupNeeded) {
+      remoteBackupFm.list(remoteBackupPath).toSeq.par
+        .filter( f => !f.isDirectory && f.getPath.getName.matches("[A-Z]\\.zip"))
+        .foreach( f => Try(remoteBackupFm.delete(f.getPath)))
+      Try(remoteBackupFm.delete( new Path(remoteBackupPath, "index")))
+      rotatingKeysCleanupNeeded = false
+    }
+
+    //return
+    backupId
   }
 
   /**
@@ -806,90 +804,83 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   private def syncRemoteBackup(backupId: Int, version: Long): String = {
 
-    // process remoteCleanupList before syncing new files
-    remoteCleanupList.par.foreach( f =>
-      remoteBackupFm.delete(f)
-    )
-    remoteCleanupList.clear
-
     // make sure backup is existing
-    assert(backupEngine.getBackupInfo.asScala.exists(_.backupId() == backupId), s"backupId $backupId for $version not found")
+    assert(getBackupInfo.values.exists(_ == backupId), s"backupId $backupId for $version not found")
+
+    // cleanup old backups
+    val backupInfosToDelete = cleanupOldLocalBackups()
 
     // diff shared data files
-    val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(new Path(remoteBackupPath,"shared"), new Path(localBackupPath,"shared"), _ => true, true )
+    val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(remoteBackupSharedPath, localBackupSharedPath, _.endsWith(".sst"), true )
     logDebug(s"found ${sharedFiles2Copy.size} files to copy to remote filesystem and ${sharedFiles2Del.size} files to delete for $this")
 
     // copy new data files in parallel
     sharedFiles2Copy.par.foreach( f =>
-      copyLocalToRemoteFile(f, new Path(remoteBackupPath,s"shared/${f.getName}"), true)
+      copyLocalToRemoteFile(f, new Path(remoteBackupSharedPath,f.getName), true)
     )
 
     // save metadata & private files as zip archive
-    val backupKey = getBackupKey(version)
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
-    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"$backupKey.zip"))
+    val tstamp = System.currentTimeMillis()
+    val contextId = Option(TaskContext.get()).map( c => s"${c.stageId}.${c.stageAttemptNumber}.${c.taskAttemptId}.${c.attemptNumber()}").getOrElse("0")
+    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"${version}_${contextId}_$tstamp.zip"))
 
     // save schema if changed
     ensureBackupSchemasUpToDate(version)
 
-    // update index of backups
-    backupList.find{ case (v,(b,k)) => k == backupKey}
-      .foreach{ case (v,(b,k)) => backupList.remove(v)} // remove existing entry for this backup key
-    backupList.put(version, (backupId,backupKey))
-    syncRemoteIndex()
+    // delete old backup files
+    cleanupRemoteBackupVersions(backupInfosToDelete)
 
     // delete old data files in parallel
     sharedFiles2Del.par.foreach( f => remoteBackupFm.delete(f))
 
     //return
-    backupKey
-  }
-
-  /**
-    * get backup key for version
-    * if rotatingBackupKey is set, this is a rotating key with minVersionsToRetain possible values
-    * otherwise it's the version
-    */
-  private def getBackupKey(version: Long) = {
-    if (rotatingBackupKey) MiscHelper.nbToChar((version % storeConf.minVersionsToRetain).toInt)
-    else version.toString
+    version.toString
   }
 
   /**
     * keep latest x backup versions, where x can be configured by minVersionsToRetain
     */
-  private def cleanupOldBackups(): Unit = {
-    val backupsSorted = backupEngine.getBackupInfo.asScala.toSeq.sortBy(_.appMetadata().toLong)
-    val backupsToDelete = backupsSorted.take(backupsSorted.size-storeConf.minVersionsToRetain)
-    backupsToDelete.foreach( b => deleteBackup(b.backupId()))
+  private def cleanupOldLocalBackups(): Seq[(Long,Int)] = {
+    val backupInfosSorted = getBackupInfo.toSeq.sortBy(_._1)
+    val backupInfosToDelete = backupInfosSorted.take(backupInfosSorted.size-storeConf.minVersionsToRetain)
+    cleanupLocalBackups(backupInfosToDelete)
+    logDebug( s"backup engine contains the following backups for $this: " + getBackupInfoStr)
+    //return
+    backupInfosToDelete
+  }
+
+  private def cleanupLocalBackups(backupInfos: Seq[(Long,Int)]): Unit = {
+    // delete local backup versions
+    backupInfos.map{ case (v,b) => b}.distinct.foreach( deleteLocalBackup )
     backupEngine.garbageCollect()
-    logDebug( s"backup engine contains the following backups for $this: " + backupEngine.getBackupInfo.asScala.map(b => s"v=${b.appMetadata()},b=${b.backupId}").mkString("; "))
+  }
+
+  private def cleanupRemoteBackupVersions(backupInfos: Seq[(Long,Int)]): Unit = {
+    // search and delete remote version files
+    getRemoteBackupInfo
+      .filter{ case (v,tstmp,f) => backupInfos.exists( _._1 == v )}
+      .par.foreach{ case (v,tstmp,f) =>
+        remoteBackupFm.delete( f.getPath )
+      }
+  }
+
+  private def cleanupFutureRemoteSchemas( currentVersion: Long ): Unit = {
+    // delete future schema versions - to avoid later conflicts
+    backupSchemas.filter(_._1 > currentVersion)
+      .foreach{ case (v, t, s) =>
+        remoteBackupFm.delete( new Path(remoteBackupSchemaPath, getRemoteBackupSchemaFilename(v, t)))
+      }
   }
 
   /**
     * delete backup from backup engine
     */
-  private def deleteBackup(backupId:Int): Unit = {
+  private def deleteLocalBackup(backupId:Int): Unit = {
     Try(backupEngine.deleteBackup(backupId)) match {
       case Failure(e) => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' while deleting backup with backupId $backupId for $this")
       case _ => Unit
-    }
-  }
-
-  /**
-    * update index on remote filesystem
-    */
-  private def syncRemoteIndex(): Unit = {
-    writeToRemoteFile( new Path(remoteBackupPath,"index"), true ) { os =>
-      val baOs = new ByteArrayOutputStream()
-      val printOs = new PrintStream(baOs)
-      backupList.toSeq.sortBy(_._1)
-        .foreach { case (v, (b, k)) => printOs.println(s"version: $v, backupId: $b, backupKey: $k") }
-      // this is for debugging consistency problems with S3
-      logInfo("new remote index file content: "+baOs.toString().replace(System.getProperty("line.separator"), "; "))
-      printOs.close()
-      os.write(baOs.toByteArray)
     }
   }
 
@@ -912,22 +903,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }).toSeq
 
     // find local files not existing or different in remote dir
-    // exception: if this task is a retry, we will copy all local files to avoid later checksum conflicts (otherwise we would need to calculate a checksum and compare between remote & local file)
-    val isTaskRetry = Option(TaskContext.get()).map(_.attemptNumber()>0).getOrElse(false)
-    val files2Copy = if (isTaskRetry) {
-      logInfo("this task is a retry, copying all local files to remote to avoid later rocksdb checksum conflicts")
-      localFiles.map(_.getPath)
-    } else {
-      localFiles.flatMap( lf =>
-        remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
-          case None => Some(lf) // not existing -> copy
-          case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> copy
-            if (errorOnChange) logError(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
+    val files2Copy = localFiles.flatMap( lf =>
+      remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
+        case None => Some(lf) // not existing -> copy
+        case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> exception or overwrite?
+          if (!errorOnChange) {
+            logWarning(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
             Some(lf)
-          case _ => None // existing and the same -> nothing
-        }
-      ).map(_.getPath)
-    }
+          } else {
+            throw new IllegalStateException(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}!")
+          }
+        case _ => None // existing and the same -> nothing
+      }
+    ).map(_.getPath)
 
     // delete remote files not existing in local dir
     val files2Del = remoteFiles.filter( rf => !localFiles.exists( lf => lf.getPath.getName==rf.getPath.getName ))
@@ -938,34 +926,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       logWarning(s"Synchronization of local -> remote would delete all remote files. This is strange and is avoided for now. Local files: ${localFiles.mkString(", ")}. Remote files: ${remoteFiles.mkString(", ")}.")
       (files2Copy, Seq())
     } else (files2Copy,files2Del)
-  }
-
-  /**
-    * reads archive files on remote filesystem and tries to reconstruct the index file
-    * this is only needed if index file got corrupted on remote filesystem
-    */
-  private def getBackupListFromRemoteFiles = {
-    // search and delete remote backup
-    val archiveFiles = remoteBackupFm.list(remoteBackupPath, new PathFilter {
-      override def accept(path: Path): Boolean = path.getName.endsWith(".zip")
-    })
-    archiveFiles.map { f =>
-      val backupKey = f.getPath.getName.takeWhile(_ != '.')
-      val input = new ZipInputStream(remoteBackupFm.open(f.getPath))
-      val metaFileEntry = Iterator.continually(input.getNextEntry)
-        .takeWhile(_ != null)
-        .find(entry => entry.getName.matches(".*meta/[0-9]*"))
-        .getOrElse(throw new IllegalStateException(s"Couldn't find meta file in archive ${f.getPath}"))
-      val backupId = metaFileEntry.getName.reverse.takeWhile(_ != '/').reverse.toInt
-      // read metafile
-      val metaBuffer = new Array[Byte](1000) // metafile shouldn't be bigger than that...
-      input.read(metaBuffer)
-      val metaLines = new String(metaBuffer).lines.toSeq
-      val metaLineIdx = metaLines.indexWhere(_.startsWith("metadata"))
-      val version = metaLines(metaLineIdx + 1).toLong
-      input.close()
-      (version, (backupId,backupKey))
-    }.toMap
   }
 
   private def getHadoopFileBufferSize = hadoopConf.getInt("io.file.buffer.size", 4096)
@@ -1012,7 +972,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * Get iterator of all the data of the latest version of the store.
     */
   private[state] def latestIterator(): Iterator[UnsafeRowPair] = {
-    val maxVersion = backupList.keys.max
+    val maxVersion = getBackupInfo.keys.max
     getStore(maxVersion).iterator()
   }
 
@@ -1139,10 +1099,6 @@ object RocksDbStateStoreProvider extends Logging {
 
   final val DEFAULT_STATE_LOCAL_WAL_DIR: String = getJavaTempDir
 
-  final val STATE_ROTATING_BACKUP_KEYS: String = "spark.sql.streaming.stateStore.rotatingBackupKeys"
-
-  final val DEFAULT_STATE_ROTATING_BACKUP_KEYS: String = "false"
-
   final val STATE_COMPRESSION_TYPE: String = "spark.sql.streaming.stateStore.compressionType"
 
   final val DEFAULT_STATE_COMPRESSION_TYPE: String = null // NO_COMPRESSION
@@ -1150,10 +1106,6 @@ object RocksDbStateStoreProvider extends Logging {
   final val STATE_CLOSE_DB_AFTER_COMMIT: String = "spark.sql.streaming.stateStore.closeDbAfterCommit"
 
   final val DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT: String = "true"
-
-  final val SHARE_ROCKSDB_FILES_WITH_CHECKSUM: String = "spark.sql.streaming.stateStore.shareRocksDbFilesWithChecksum"
-
-  final val DEFAULT_SHARE_ROCKSDB_FILES_WITH_CHECKSUM: String = "false"
 
   final val REMOTE_UPLOAD_RETRIES: String = "spark.sql.streaming.stateStore.remoteUpload.retries"
 
@@ -1222,12 +1174,6 @@ object RocksDbStateStoreProvider extends Logging {
       case Failure(e) => throw new IllegalArgumentException(e)
     }
 
-  private def setRotatingBackupKey(conf: Map[String, String]): Boolean =
-    Try(conf.getOrElse(STATE_ROTATING_BACKUP_KEYS, DEFAULT_STATE_ROTATING_BACKUP_KEYS).toBoolean) match {
-      case Success(value) => value
-      case Failure(e) => throw new IllegalArgumentException(e)
-    }
-
   private def setCompressionType(conf: Map[String, String]): CompressionType =
     Try(CompressionType.getCompressionType(conf.getOrElse(STATE_COMPRESSION_TYPE, DEFAULT_STATE_COMPRESSION_TYPE))) match {
       case Success(value) => value
@@ -1236,12 +1182,6 @@ object RocksDbStateStoreProvider extends Logging {
 
   private def setCloseDbAfterCommit(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(STATE_CLOSE_DB_AFTER_COMMIT, DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT).toBoolean) match {
-      case Success(value) => value
-      case Failure(e) => throw new IllegalArgumentException(e)
-    }
-
-  private def setShareRocksDbFilesWithChecksum(conf: Map[String, String]): Boolean =
-    Try(conf.getOrElse(SHARE_ROCKSDB_FILES_WITH_CHECKSUM, DEFAULT_SHARE_ROCKSDB_FILES_WITH_CHECKSUM).toBoolean) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
