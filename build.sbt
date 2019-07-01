@@ -17,7 +17,7 @@
 organization := "ru.chermenin"
 name := "spark-states"
 
-version := "0.8.23"
+version := "0.8.24"
 
 crossScalaVersions := Seq("2.11.12", "2.12.7")
 

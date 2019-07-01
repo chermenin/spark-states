@@ -568,10 +568,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
   def getRemoteBackupInfo: Seq[(Long, Long, FileStatus)] = {
     remoteBackupFm.list(remoteBackupPath).toSeq
-      .filter( f => !f.isDirectory && f.getPath.getName.matches("[0-9_]*.zip"))
+      .filter( f => !f.isDirectory && f.getPath.getName.matches("[0-9_\\.]*.zip"))
       .map{ f => // extract version and timestamp
-        val Array(v, tstmp) = f.getPath.getName.stripSuffix(".zip").split('_')
-        (v.toLong, tstmp.toLong,f)
+        // filename format is "<version>_<tstampMs>.zip" or "<version>_<contextId>_<tstampMs>.zip"
+        val parsedName = f.getPath.getName.stripSuffix(".zip").split('_')
+        assert(parsedName.length >= 2, s"Filename format is strange for ${f.getPath}")
+        val version = parsedName.head.toLong
+        val tstamp = parsedName.last.toLong
+        (version, tstamp,f)
       }
   }
 
@@ -812,8 +816,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // save metadata & private files as zip archive
     val metadataFile = new File(s"$localBackupDir${File.separator}meta${File.separator}$backupId")
     val privateFiles = new File(s"$localBackupDir${File.separator}private${File.separator}$backupId").listFiles().toSeq
-    val tstmp = System.currentTimeMillis()
-    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"${version}_$tstmp.zip"))
+    val tstamp = System.currentTimeMillis()
+    val contextId = Option(TaskContext.get()).map( c => s"${c.stageId}.${c.stageAttemptNumber}.${c.taskAttemptId}.${c.attemptNumber()}").getOrElse("0")
+    compressToRemoteFile(metadataFile +: privateFiles, new Path(remoteBackupPath,s"${version}_${contextId}_$tstamp.zip"))
 
     // save schema if changed
     ensureBackupSchemasUpToDate(version)
@@ -888,26 +893,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }).toSeq
 
     // find local files not existing or different in remote dir
-    // exception: if this task is a retry, we will copy all local files to avoid later checksum conflicts (otherwise we would need to calculate a checksum and compare between remote & local file)
-    val isTaskRetry = Option(TaskContext.get()).map(_.attemptNumber()>0).getOrElse(false)
-    val files2Copy = if (isTaskRetry) {
-      logInfo("this task is a retry, copying all local files to remote to avoid later rocksdb checksum conflicts")
-      localFiles.map(_.getPath)
-    } else {
-      localFiles.flatMap( lf =>
-        remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
-          case None => Some(lf) // not existing -> copy
-          case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> exception or overwrite?
-            if (!errorOnChange) {
-              logWarning(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
-              Some(lf)
-            } else {
-              throw new IllegalStateException(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}!")
-            }
-          case _ => None // existing and the same -> nothing
-        }
-      ).map(_.getPath)
-    }
+    val files2Copy = localFiles.flatMap( lf =>
+      remoteFiles.find( rf => rf.getPath.getName==lf.getPath.getName ) match {
+        case None => Some(lf) // not existing -> copy
+        case Some(rf) if rf.getLen!=lf.getLen => // existing and different -> exception or overwrite?
+          if (!errorOnChange) {
+            logWarning(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}. Overwriting for now.")
+            Some(lf)
+          } else {
+            throw new IllegalStateException(s"Remote file ${rf.getPath} is different from local file ${lf.getPath}!")
+          }
+        case _ => None // existing and the same -> nothing
+      }
+    ).map(_.getPath)
 
     // delete remote files not existing in local dir
     val files2Del = remoteFiles.filter( rf => !localFiles.exists( lf => lf.getPath.getName==rf.getPath.getName ))
