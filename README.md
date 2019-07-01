@@ -1,6 +1,7 @@
 ## Custom state store providers for Apache Spark
 
 [![Build Status](https://travis-ci.org/chermenin/spark-states.svg?branch=master)](https://travis-ci.org/chermenin/spark-states)
+[![CodeFactor](https://www.codefactor.io/repository/github/chermenin/spark-states/badge)](https://www.codefactor.io/repository/github/chermenin/spark-states)
 
 Custom State Stores for Apache Spark to keep data between micro-batches for stateful stream processing.
 
