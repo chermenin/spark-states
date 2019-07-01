@@ -537,20 +537,26 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         }
 
         // copy shared files in parallel
-        remoteBackupFm.list(remoteBackupSharedPath).toSeq.par
-          .filter( f => !f.isDirectory && f.getPath.getName.endsWith(".sst"))
-          .foreach(f => try {
-            // shared files with checksum must be copied into a different folder
-            // TODO: remove legacy mode after migration
-            val localSharedBackupPath = if (f.getPath.getName.matches("[0-9]*_[0-9]*_[0-9]*.sst")) new Path(localBackupSharedPath, f.getPath.getName)
-            else new Path(localBackupPath, s"shared/${f.getPath.getName}") // legacy shared file location...
-            copyRemoteToLocalFile(f.getPath, localSharedBackupPath, true)
-          } catch {
-            // This is to be tolerant in case of inconsistent S3 metadata: the object might be deleted but it's still listed in state
-            // In this case we can catch the FileNotFoundException, log it as error and do not fail the job.
-            // This is no problem for state consistency, as the problematic file should have been deleted. It's no longer needed.
-            case e:FileNotFoundException => logWarning( s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
-          })
+        try {
+          remoteBackupFm.list(remoteBackupSharedPath).toSeq.par
+            .filter(f => !f.isDirectory && f.getPath.getName.endsWith(".sst"))
+            .foreach(f => try {
+              // shared files with checksum must be copied into a different folder
+              // TODO: remove legacy mode after migration
+              val localSharedBackupPath = if (f.getPath.getName.matches("[0-9]*_[0-9]*_[0-9]*.sst")) new Path(localBackupSharedPath, f.getPath.getName)
+              else new Path(localBackupPath, s"shared/${f.getPath.getName}") // legacy shared file location...
+              copyRemoteToLocalFile(f.getPath, localSharedBackupPath, true)
+            } catch {
+              // This is to be tolerant in case of inconsistent S3 metadata: the object might be deleted but it's still listed in state
+              // In this case we can catch the FileNotFoundException, log it as error and do not fail the job.
+              // This is no problem for state consistency, as the problematic file should have been deleted. It's no longer needed.
+              case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'restoreFromRemoteBackups' while reading shared remote backup files. This is an inconsistency between S3 object and metadata. Please cleanup manually the no longer existing file.")
+            })
+        } catch {
+          case e: FileNotFoundException => logInfo(s"$remoteBackupSharedPath doesn't yet exist. It will be created on commit.")
+        }
+
+        // open backup engine
         backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       }
       logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs, existing backups are "+getBackupInfoStr)
@@ -802,7 +808,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     assert(getBackupInfo.values.exists(_ == backupId), s"backupId $backupId for $version not found")
 
     // cleanup old backups
-    cleanupOldBackups()
+    val backupInfosToDelete = cleanupOldLocalBackups()
 
     // diff shared data files
     val (sharedFiles2Copy,sharedFiles2Del) = getRemoteSyncList(remoteBackupSharedPath, localBackupSharedPath, _.endsWith(".sst"), true )
@@ -823,6 +829,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     // save schema if changed
     ensureBackupSchemasUpToDate(version)
 
+    // delete old backup files
+    cleanupRemoteBackupVersions(backupInfosToDelete)
+
     // delete old data files in parallel
     sharedFiles2Del.par.foreach( f => remoteBackupFm.delete(f))
 
@@ -833,12 +842,13 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   /**
     * keep latest x backup versions, where x can be configured by minVersionsToRetain
     */
-  private def cleanupOldBackups(): Unit = {
+  private def cleanupOldLocalBackups(): Seq[(Long,Int)] = {
     val backupInfosSorted = getBackupInfo.toSeq.sortBy(_._1)
     val backupInfosToDelete = backupInfosSorted.take(backupInfosSorted.size-storeConf.minVersionsToRetain)
     cleanupLocalBackups(backupInfosToDelete)
-    cleanupRemoteBackupVersions(backupInfosToDelete)
     logDebug( s"backup engine contains the following backups for $this: " + getBackupInfoStr)
+    //return
+    backupInfosToDelete
   }
 
   private def cleanupLocalBackups(backupInfos: Seq[(Long,Int)]): Unit = {
