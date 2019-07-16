@@ -63,17 +63,21 @@ object MiscHelper {
         .takeWhile(_ != null)
         .foreach(entry => {
           val file = new File(s"$tgtPath${File.separator}${entry.getName}")
-          file.getParentFile.mkdirs
-          val output = new FileOutputStream(file)
-          try {
-            Iterator.continually(input.read(buffer))
-              .takeWhile(_ != -1)
-              .filter(_ > 0)
-              .foreach(read =>
-                output.write(buffer, 0, read)
-              )
-          } finally {
-            output.close()
+          if (entry.isDirectory) {
+            file.mkdirs
+          } else {
+            file.getParentFile.mkdirs
+            val output = new FileOutputStream(file)
+            try {
+              Iterator.continually(input.read(buffer))
+                .takeWhile(_ != -1)
+                .filter(_ > 0)
+                .foreach(read =>
+                  output.write(buffer, 0, read)
+                )
+            } finally {
+              output.close()
+            }
           }
         })
     } finally {
