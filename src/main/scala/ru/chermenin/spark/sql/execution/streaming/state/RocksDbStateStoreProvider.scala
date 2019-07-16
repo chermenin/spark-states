@@ -207,11 +207,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
 
     /**
-      * Commit all the updates that have been made to the store, and return the new version.
+      * Commit all the updates that have been made to the store
+      * Execute state maintenance if embedded mode is enabled
+      *
+      * Return the new version number.
       */
     override def commit(): Long = RocksDbStateStoreProvider.this.synchronized  {
       try {
         MiscHelper.verify(state == State.Updating, "Cannot commit already committed or aborted state")
+
+        if (triggerMaintenance) {
+          execStateMaintenance()
+          triggerMaintenance = false
+        }
 
         updateStatistics()
 
@@ -293,7 +301,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def metrics: StateStoreMetrics = {
       val estimatedKeyNb: Long = rocksdbVolumeStatistics.getOrElse(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY, 0)
       val memTableSize: Long = rocksdbVolumeStatistics.getOrElse(ROCKSDB_SIZE_ALL_MEM_TABLES, 0)
-      StateStoreMetrics( estimatedKeyNb, memTableSize + rocksDbSharedFilesSize, Map.empty)
+      StateStoreMetrics( estimatedKeyNb, memTableSize + rocksDbCurrentSize, Map.empty)
     }
 
     /**
@@ -332,7 +340,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var manualRocksDbCompaction: Boolean = _
   @volatile private var embeddedMaintenance: Boolean = _
   @volatile private var remoteUploadRetries: Int = 1
-  @volatile private var rocksDbSharedFilesSize: Long = 0 // store shared file size metric
+  @volatile private var rocksDbBackupSize: Long = 0 // store backup size metric
+  @volatile private var rocksDbCurrentSize: Long = 0 // store backup size metric
   @volatile private var removeExpiredRowsInMaintenance: Boolean = _
   @volatile private var removeExpiredRowsInMaintenanceColName: String = _
   private var remoteBackupPath: Path = _
@@ -352,6 +361,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var backupSchemas: Seq[(Long,String,StructType)] = Seq()
   private var backupKeySchemaUpToDate = false
   private var backupValueSchemaUpToDate = false
+  private var triggerMaintenance = false
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -657,58 +667,67 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     */
   override def doMaintenance(): Unit = synchronized {
     try {
-      logDebug(s"starting doMaintenance for $this")
-
-      val t = MiscHelper.measureTime {
-
-        // flush WAL to SST Files and do manual compaction
-        val opened = if (currentDb == null) {
-          currentDb = openDb
-          true
-        } else false
-
-        // remove expired Records from state
-        if (removeExpiredRowsInMaintenance) {
-          val currentTime = System.currentTimeMillis()
-          val groupStateValueColIndex = valueSchema.fieldIndex("groupState")
-          val groupStateValueSchema = valueSchema(groupStateValueColIndex).dataType.asInstanceOf[StructType]
-          val timeoutColIndex = groupStateValueSchema.fieldIndex(removeExpiredRowsInMaintenanceColName)
-          val stateIterator = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
-          stateIterator.foreach {
-            rowPair =>
-              if (!rowPair.value.isNullAt(groupStateValueColIndex)) {
-                val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
-                if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
-                  val timeout = groupStateValueRow.getLong(timeoutColIndex)
-                  if (timeout>0 && timeout <= currentTime) currentDb.delete(rowPair.key.getBytes)
-                }
-              }
-          }
-        }
-
-        // flush WAL to SST Files and do manual compaction
-        currentDb.flush(new FlushOptions().setWaitForFlush(true))
-        if( manualRocksDbCompaction ) {
-          currentDb.pauseBackgroundWork()
-          currentDb.compactRange()
-          currentDb.continueBackgroundWork()
-        }
-        if (opened) closeDb()
-
-        // estimate db size
-        rocksDbSharedFilesSize = localBackupFs.listStatus(localBackupSharedPath)
-          .map(_.getLen).sum
-
-        // check free diskspace
-        //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
-        //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
+      if (embeddedMaintenance) {
+        logDebug(s"trigger embedded maintenance for $this")
+        triggerMaintenance = true
+      } else {
+        execStateMaintenance()
       }
-      logInfo(s"doMaintenance for $this took $t secs, shared file size is ${MiscHelper.formatBytes(rocksDbSharedFilesSize)}")
     } catch {
       case e: Exception =>
         logError(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' in method 'doMaintenance' of $this")
         throw e
     }
+  }
+
+  private def execStateMaintenance(): Unit = {
+    logDebug(s"starting state maintenance for $this")
+
+    val t = MiscHelper.measureTime {
+
+      val opened = if (currentDb == null) {
+        currentDb = openDb
+        true
+      } else false
+
+      // remove expired Records from state
+      if (removeExpiredRowsInMaintenance) {
+        val currentTime = System.currentTimeMillis()
+        val groupStateValueColIndex = valueSchema.fieldIndex("groupState")
+        val groupStateValueSchema = valueSchema(groupStateValueColIndex).dataType.asInstanceOf[StructType]
+        val timeoutColIndex = groupStateValueSchema.fieldIndex(removeExpiredRowsInMaintenanceColName)
+        val stateIterator = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
+        stateIterator.foreach {
+          rowPair =>
+            if (!rowPair.value.isNullAt(groupStateValueColIndex)) {
+              val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
+              if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
+                val timeout = groupStateValueRow.getLong(timeoutColIndex)
+                if (timeout > 0 && timeout <= currentTime) currentDb.delete(rowPair.key.getBytes)
+              }
+            }
+        }
+      }
+
+      // flush WAL to SST Files and do manual compaction
+      currentDb.flush(new FlushOptions().setWaitForFlush(true))
+      if (manualRocksDbCompaction) {
+        currentDb.pauseBackgroundWork()
+        currentDb.compactRange()
+        currentDb.continueBackgroundWork()
+      }
+      if (opened) closeDb()
+
+      // estimate db size
+      rocksDbCurrentSize = FileUtils.sizeOfDirectory( new File(localDbDir))
+      rocksDbBackupSize = localBackupFs.listStatus(localBackupSharedPath)
+        .map(_.getLen).sum
+
+      // check free diskspace
+      //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
+      //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
+    }
+    logInfo(s"state maintenance for $this took $t secs, current db files size: ${MiscHelper.formatBytes(rocksDbBackupSize)}, backup shared files size: ${MiscHelper.formatBytes(rocksDbCurrentSize)}")
   }
 
   def closeDb(): Unit = {
