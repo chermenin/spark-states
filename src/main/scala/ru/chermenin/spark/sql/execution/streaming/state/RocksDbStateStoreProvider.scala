@@ -217,10 +217,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         state = State.Committed
         createBackup(newVersion)
-        if (closeDbOnCommit) {
-          currentDb.close()
-          currentDb = null
-        }
+        if (closeDbOnCommit) closeDb()
 
         logInfo(s"Committed version $newVersion for $this")
         newVersion
@@ -332,6 +329,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
   @volatile private var closeDbOnCommit: Boolean = _
+  @volatile private var manualRocksDbCompaction: Boolean = _
+  @volatile private var embeddedMaintenance: Boolean = _
   @volatile private var remoteUploadRetries: Int = 1
   @volatile private var rocksDbSharedFilesSize: Long = 0 // store shared file size metric
   @volatile private var removeExpiredRowsInMaintenance: Boolean = _
@@ -353,7 +352,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private var backupSchemas: Seq[(Long,String,StructType)] = Seq()
   private var backupKeySchemaUpToDate = false
   private var backupValueSchemaUpToDate = false
-  private var rotatingKeysCleanupNeeded = false
 
   /**
     * Initialize the provide with more contextual information from the SQL operator.
@@ -385,6 +383,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       this.ttlSec = setTTL(storeConf.confs)
       this.isStrictExpire = setExpireMode(storeConf.confs)
       this.closeDbOnCommit = setCloseDbAfterCommit(storeConf.confs)
+      this.manualRocksDbCompaction = setManualRocksDbCompaction(storeConf.confs)
+      this.embeddedMaintenance = setEmbeddedMaintenance(storeConf.confs)
       this.remoteUploadRetries = setRemoteUploadRetries(storeConf.confs)
       this.removeExpiredRowsInMaintenance = setRemoveExpiredRowsInMaintenance(storeConf.confs)
       this.removeExpiredRowsInMaintenanceColName = setRemoveExpiredRowsInMaintenanceColName(storeConf.confs)
@@ -426,10 +426,10 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         //.setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(false).setBlockCacheSize(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB))
         //.setTableFormatConfig(new BlockBasedTableConfig().setNoBlockCache(true))
         .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(getGlobalBlockCache(setBlockCacheSizeMb(storeConf.confs) * SizeUnit.MB)))
-        .setDisableAutoCompactions(true) // we trigger manual compaction during state maintenance with compactRange()
+        .setDisableAutoCompactions( manualRocksDbCompaction ) // if auto compactions is disabled, we trigger manual compaction during state maintenance with compactRange()
         .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
         .setCompressionType(setCompressionType(storeConf.confs))
-        .setCompactionStyle(CompactionStyle.UNIVERSAL)
+        //.setCompactionStyle(CompactionStyle.UNIVERSAL) // use default normal Leveled compaction for now
         //.setParanoidChecks(false) // use default for now
         //.setForceConsistencyChecks(false) // use default for now
         //.setParanoidFileChecks(false) // use default for now
@@ -478,36 +478,14 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val t = MiscHelper.measureTime {
 
         // copy metadata/private files
-        Try(remoteBackupFm.open(new Path(remoteBackupPath, "index"))) match {
-
-          // if legacy rotating key backup layout -> convert to normal layout
-          // TODO: remove legacy mode after migration
-          case Success(backupListInputStream) =>
-            // copy metadata/private files according to backupList in parallel
-            val backupListReader = new BufferedReader(new InputStreamReader(backupListInputStream))
-            val backupListParsed = backupListReader.lines.iterator.asScala.toArray.map(_.split(',').map(_.trim.split(':')).map(e => (e(0).trim, e(1).trim)).toMap)
-            backupListInputStream.close() // it is tricky that input stream isn't closed at all or even twice... iterator.toArray / manual close seems to be proper
-            val backupList = backupListParsed.map(b => b("version").toLong -> (b("backupId").toInt, b("backupKey"))).toMap
-            backupList.values.map{ case (backupId, backupKey) => s"$backupKey.zip" }.par
-              .foreach(filename => try {
-                MiscHelper.decompressFromRemote(new Path(remoteBackupPath, filename), localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
-              } catch {
-                case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup $filename in method 'init'")
-              })
-            rotatingKeysCleanupNeeded = true
-            logInfo(s"legacy rotating key backup layout detected -> converted to normal layout for $this: " + backupList.toSeq.sortBy(_._1).map(b => s"v=${b._1},b=${b._2._1},k=${b._2._2}").mkString("; "))
-
-          // normal backup layout -> copy latest file per version
-          case Failure(e) =>
-            getRemoteBackupInfo
-              .groupBy( _._1 ) // group by version
-              .values.map( fs => fs.maxBy(_._2)._3) // get entry with latest timestamp per group
-              .par.foreach(f => try {
-                MiscHelper.decompressFromRemote(f.getPath, localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
-              } catch {
-                case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup ${f.getPath.getName} in method 'init'")
-              })
-        }
+        getRemoteBackupInfo
+          .groupBy( _._1 ) // group by version
+          .values.map( fs => fs.maxBy(_._2)._3) // get entry with latest timestamp per group
+          .par.foreach(f => try {
+            MiscHelper.decompressFromRemote(f.getPath, localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
+          } catch {
+            case e: FileNotFoundException => logWarning(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' when copying metadata/private files from remote backup ${f.getPath.getName} in method 'init'")
+          })
 
         // copy shared files in parallel
         try {
@@ -540,8 +518,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       backupEngine = BackupEngine.open(options.getEnv, backupDBOptions)
       currentDb = openDb
       createBackup(0L)
-      currentDb.close()
-      currentDb = null
+      closeDb()
     }
   }
 
@@ -566,9 +543,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * trigger a refresh of the database
     */
   def refreshDb(): RocksDB = {
-    if (currentDb != null) {
-      currentDb.close()
-    }
+    if (currentDb != null) closeDb()
     currentDb = openDb
     currentDb
   }
@@ -659,10 +634,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // close db and restore backup
       val tRestore = MiscHelper.measureTime {
-        if (currentDb != null) {
-          currentDb.close() // we need to close before restore
-          currentDb = null
-        }
+        if (currentDb != null)  closeDb() // we need to close before restore
         val restoreOptions = new RestoreOptions(false)
         backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
         restoreOptions.close()
@@ -716,13 +688,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
         // flush WAL to SST Files and do manual compaction
         currentDb.flush(new FlushOptions().setWaitForFlush(true))
-        currentDb.pauseBackgroundWork()
-        currentDb.compactRange()
-        currentDb.continueBackgroundWork()
-        if (opened) {
-          currentDb.close()
-          currentDb = null
+        if( manualRocksDbCompaction ) {
+          currentDb.pauseBackgroundWork()
+          currentDb.compactRange()
+          currentDb.continueBackgroundWork()
         }
+        if (opened) closeDb()
 
         // estimate db size
         rocksDbSharedFilesSize = localBackupFs.listStatus(localBackupSharedPath)
@@ -740,16 +711,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
   }
 
+  def closeDb(): Unit = {
+    currentDb.pauseBackgroundWork()
+    currentDb.close()
+    currentDb = null
+  }
+
   /**
     * Called when the provider instance is unloaded from the executor.
     */
   override def close(): Unit = synchronized {
     try {
       // cleanup
-      if(currentDb!=null) {
-        currentDb.close()
-        currentDb = null
-      }
+      if(currentDb!=null) closeDb()
       backupEngine.close()
       options.close()
       writeOptions.close()
@@ -797,16 +771,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       syncRemoteBackup(backupId, version)
     }
     logDebug(s"synced $this version $version backupId $backupId to remote filesystem, took $tSync secs")
-
-    // cleanup legacy rotating key layout
-    // TODO: cleanup after migration
-    if (rotatingKeysCleanupNeeded) {
-      remoteBackupFm.list(remoteBackupPath).toSeq.par
-        .filter( f => !f.isDirectory && f.getPath.getName.matches("[A-Z]\\.zip"))
-        .foreach( f => Try(remoteBackupFm.delete(f.getPath)))
-      Try(remoteBackupFm.delete( new Path(remoteBackupPath, "index")))
-      rotatingKeysCleanupNeeded = false
-    }
 
     //return
     backupId
@@ -1213,6 +1177,18 @@ object RocksDbStateStoreProvider extends Logging {
 
   private def setCloseDbAfterCommit(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(STATE_CLOSE_DB_AFTER_COMMIT, DEFAULT_STATE_CLOSE_DB_AFTER_COMMIT).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setManualRocksDbCompaction(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(STATE_MANUAL_ROCKS_DB_COMPACTION, DEFAULT_STATE_MANUAL_ROCKS_DB_COMPACTION).toBoolean) match {
+      case Success(value) => value
+      case Failure(e) => throw new IllegalArgumentException(e)
+    }
+
+  private def setEmbeddedMaintenance(conf: Map[String, String]): Boolean =
+    Try(conf.getOrElse(STATE_EMBEDDED_MAINTENANCE, DEFAULT_STATE_EMBEDDED_MAINTENANCE).toBoolean) match {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
