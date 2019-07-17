@@ -131,6 +131,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       */
     override def get(key: UnsafeRow): UnsafeRow = RocksDbStateStoreProvider.this.synchronized {
       try {
+        MiscHelper.verify(currentDb != null, "RocksDb must be opened")
+
         var returnValue: UnsafeRow = null
         val t = MiscHelper.measureTime {
           returnValue = if (isStrictExpire) {
@@ -157,6 +159,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def put(key: UnsafeRow, value: UnsafeRow): Unit = RocksDbStateStoreProvider.this.synchronized {
       try {
         MiscHelper.verify(state == State.Updating, "Cannot put entry into already committed or aborted state")
+        MiscHelper.verify(currentDb != null, "RocksDb must be opened")
+
         val t = MiscHelper.measureTime {
           val keyCopy = key.copy()
           val valueCopy = value.copy()
@@ -178,8 +182,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def remove(key: UnsafeRow): Unit = RocksDbStateStoreProvider.this.synchronized {
       try {
         MiscHelper.verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
-        currentDb.delete(key.getBytes)
+        MiscHelper.verify(currentDb != null, "RocksDb must be opened")
 
+        currentDb.delete(key.getBytes)
         if (isStrictExpire) keyCache.invalidate(key.getBytes)
       } catch {
         case e:Exception =>
@@ -215,6 +220,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     override def commit(): Long = RocksDbStateStoreProvider.this.synchronized  {
       try {
         MiscHelper.verify(state == State.Updating, "Cannot commit already committed or aborted state")
+        MiscHelper.verify(currentDb != null, "RocksDb must be opened")
 
         if (triggerMaintenance) {
           execStateMaintenance()
@@ -264,10 +270,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         //TODO: how can we rollback uncommitted changes -> we should use a transaction!
 
         state = State.Aborted
-        if (closeDbOnCommit && currentDb!=null) {
-          currentDb.close()
-          currentDb = null
-        }
+        if (closeDbOnCommit) closeDb()
 
         logInfo(s"Aborted version $newVersion for $this")
 
@@ -281,7 +284,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       * Get an iterator of all the store data.
       */
     override def iterator(): Iterator[UnsafeRowPair] = RocksDbStateStoreProvider.this.synchronized {
-      MiscHelper.verify(currentDb != null, "iterator can only be created if RocksDB is still opened")
+      MiscHelper.verify(currentDb != null, "RocksDb must be opened")
 
       val stateFromRocksIter = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
       val stateIter = {
@@ -553,7 +556,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     * trigger a refresh of the database
     */
   def refreshDb(): RocksDB = {
-    if (currentDb != null) closeDb()
+    closeDb()
     currentDb = openDb
     currentDb
   }
@@ -644,7 +647,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       // close db and restore backup
       val tRestore = MiscHelper.measureTime {
-        if (currentDb != null)  closeDb() // we need to close before restore
+        closeDb() // we need to close before restore
         val restoreOptions = new RestoreOptions(false)
         backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
         restoreOptions.close()
@@ -730,10 +733,12 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     logInfo(s"state maintenance for $this took $t secs, current db files size: ${MiscHelper.formatBytes(rocksDbBackupSize)}, backup shared files size: ${MiscHelper.formatBytes(rocksDbCurrentSize)}")
   }
 
-  def closeDb(): Unit = {
-    currentDb.pauseBackgroundWork()
-    currentDb.close()
-    currentDb = null
+  private def closeDb(): Unit = {
+    if (currentDb!=null) {
+      currentDb.pauseBackgroundWork()
+      currentDb.close()
+      currentDb = null
+    }
   }
 
   /**
@@ -742,7 +747,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   override def close(): Unit = synchronized {
     try {
       // cleanup
-      if(currentDb!=null) closeDb()
+      closeDb()
       backupEngine.close()
       options.close()
       writeOptions.close()
@@ -778,6 +783,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     }
 
     // create local backup
+    MiscHelper.verify(currentDb != null, "RocksDb must be opened")
     val tBackup = MiscHelper.measureTime {
       // Don't flush before backup, as also WAL is backuped. We can use WAL for efficient incremental backup
       backupEngine.createNewBackupWithMetadata(currentDb, version.toString, false)
