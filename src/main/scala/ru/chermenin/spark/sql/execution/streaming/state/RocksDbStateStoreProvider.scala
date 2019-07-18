@@ -620,6 +620,16 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val backupIdRecovery = getBackupInfo
         .getOrElse( version, throw new IllegalStateException(s"backup for version $version not found"))
 
+      // close db and restore backup
+      val tRestore = MiscHelper.measureTime {
+        closeDb() // we need to close before restore
+        val restoreOptions = new RestoreOptions(false)
+        backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
+        restoreOptions.close()
+        currentDb = openDb
+      }
+      logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
+
       // check key schema
       val backupKeySchema = getBackupKeySchema(version)
       if (backupKeySchema.isDefined && keySchema!=null && backupKeySchema.get!=keySchema) throw new IllegalStateException(s"backup key schema not compatible with current schema. Schema Evolution for key schema is not rational. backup: ${backupKeySchema.get.json}, current: ${keySchema.json}")
@@ -644,16 +654,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         }
         logInfo( s"migrated schema for all values of $this, took $tMigration sec")
       }
-
-      // close db and restore backup
-      val tRestore = MiscHelper.measureTime {
-        closeDb() // we need to close before restore
-        val restoreOptions = new RestoreOptions(false)
-        backupEngine.restoreDbFromBackup(backupIdRecovery, localDbDir, localWalDataDir, restoreOptions)
-        restoreOptions.close()
-        currentDb = openDb
-      }
-      logDebug(s"restored db for $this version $version from local backup, took $tRestore secs")
     }
   }
 
