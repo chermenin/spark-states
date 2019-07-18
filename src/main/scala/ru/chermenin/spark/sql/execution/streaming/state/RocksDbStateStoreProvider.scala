@@ -643,16 +643,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         val projection = SchemaHelper.getSchemaProjection(backupValueSchema.get, valueSchema, defaultValues)
         logInfo( s"value schema evolution needed for $this. Projection: $projection" )
         // migrate all records
+        var recordCnt = 0
         val tMigration = MiscHelper.measureTime {
           val allKVIter = RocksDbHelper.getIterator(currentDb, backupKeySchema.get, backupValueSchema.get)
           val unsafeConverter = UnsafeProjection.create(valueSchema) // InternalRow -> UnsafeRow
           allKVIter.foreach {
             unsafeRowPair =>
               val newValueRow = SchemaHelper.applySchemaProjection(unsafeRowPair.value, projection)
+              recordCnt = recordCnt + 1
               currentDb.put(unsafeRowPair.key.getBytes, unsafeConverter(newValueRow).getBytes)
           }
         }
-        logInfo( s"migrated schema for all values of $this, took $tMigration sec")
+        val logDefaultValues = if (defaultValues.nonEmpty) s" using defaultValue $defaultValues" else ""
+        logInfo( s"migrated schema for all values of $this took $tMigration sec for $recordCnt records $logDefaultValues")
       }
     }
   }
@@ -686,6 +689,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   private def execStateMaintenance(): Unit = {
     logDebug(s"starting state maintenance for $this")
 
+    var deleteCnt = 0
     val t = MiscHelper.measureTime {
 
       val opened = if (currentDb == null) {
@@ -706,14 +710,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
               val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
               if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
                 val timeout = groupStateValueRow.getLong(timeoutColIndex)
-                if (timeout > 0 && timeout <= currentTime) currentDb.delete(rowPair.key.getBytes)
+                if (timeout > 0 && timeout <= currentTime) {
+                  currentDb.delete(rowPair.key.getBytes)
+                  deleteCnt = deleteCnt + 1
+                }
               }
             }
         }
       }
 
-      // flush WAL to SST Files and do manual compaction
+      // flush WAL to SST Files
       currentDb.flush(new FlushOptions().setWaitForFlush(true))
+
+      // do manual compaction if desired
       if (manualRocksDbCompaction) {
         currentDb.pauseBackgroundWork()
         currentDb.compactRange()
@@ -730,7 +739,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       //val dirFreeSpace = Seq(localDbDir, localWalDataDir).distinct.map( f => s"$f=${new File(f).getUsableSpace().toFloat/1024/1024}MB")
       //logInfo(s"free disk space for this: "+dirFreeSpace.mkString(", "))
     }
-    logInfo(s"state maintenance for $this took $t secs, current db files size: ${MiscHelper.formatBytes(rocksDbBackupSize)}, backup shared files size: ${MiscHelper.formatBytes(rocksDbCurrentSize)}")
+    val logDeleteCnt = if (removeExpiredRowsInMaintenance) s" deleted $deleteCnt keys," else ""
+    logInfo(s"state maintenance for $this took $t secs,$logDeleteCnt current db files size: ${MiscHelper.formatBytes(rocksDbBackupSize)}, backup shared files size: ${MiscHelper.formatBytes(rocksDbCurrentSize)}")
   }
 
   private def closeDb(): Unit = {

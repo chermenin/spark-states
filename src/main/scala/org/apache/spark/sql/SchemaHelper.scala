@@ -64,7 +64,9 @@ object SchemaHelper extends Logging {
           }
         } else {
           // if field doesn't yet exist, create a field and populate with default value if defined
-          NewFieldProjector(tgtField.name, tgtField.dataType, defaultValueExprs.get(newPath.mkString(".")))
+          val defaultValue = defaultValueExprs.get(newPath.mkString("."))
+          logDebug(s"using defaultValue $defaultValue for new field ${tgtField.name}")
+          NewFieldProjector(tgtField.name, tgtField.dataType, defaultValue)
         }
     }
   }
