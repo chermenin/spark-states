@@ -145,6 +145,4 @@ object MiscHelper {
       logFunc(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' $errText")
       retry( retryCntMax, errText, logFunc, retryCnt+1)(code)
   }
-
-
 }
