@@ -5,7 +5,15 @@ import org.apache.spark.sql.execution.streaming.state.UnsafeRowPair
 import org.apache.spark.sql.types.StructType
 import org.rocksdb.RocksDB
 
+import scala.io.Source
+
 object RocksDbHelper {
+
+  def parseSharedFilesFromMetadata(backupDir: String, backupId: Int): Seq[String] = {
+    val metaFile = backupDir + "/meta/" + backupId
+    val sstRegex = "[0-9_]*\\.sst".r
+    Source.fromFile(metaFile).getLines().flatMap( l => sstRegex.findFirstIn(l)).toList
+  }
 
   def getIterator(db: RocksDB, keySchema: StructType, valueSchema: StructType ): Iterator[UnsafeRowPair] = {
     new Iterator[UnsafeRowPair] {

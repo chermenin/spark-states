@@ -88,21 +88,32 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
 
   def snapshot(version: Int): String = s"state.snapshot.$version"
 
+  /*
+   * Creates a new backup engine
+   * BackupEngine has to be closed manually after usage
+   */
+  private def createBackupEngine(provider: RocksDbStateStoreProvider) = {
+    val method = PrivateMethod[BackupEngine]('createBackupEngine)
+    provider invokePrivate method()
+  }
+
   def backupExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
-    val method = PrivateMethod[BackupEngine]('backupEngine)
-    val backupEngine = provider invokePrivate method()
-    backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
+    val backupEngine = createBackupEngine(provider)
+    val result = backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
+    backupEngine.close()
+    // return
+    result
   }
 
   def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Long): Unit = {
 
     // delete local backup
-    val backupEngineMethod = PrivateMethod[BackupEngine]('backupEngine)
-    val backupEngine = provider invokePrivate backupEngineMethod()
+    val backupEngine = createBackupEngine(provider)
     val backupId = backupEngine.getBackupInfo.asScala.find(_.appMetadata().toLong==version)
       .getOrElse(throw new IllegalStateException(s"Couldn't find backup for version $version"))
       .backupId
     backupEngine.deleteBackup(backupId)
+    backupEngine.close()
 
     // remove remote
     val cleanupRemoteBackupVersionsMethod = PrivateMethod[Unit]('cleanupRemoteBackupVersions)
