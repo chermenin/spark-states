@@ -769,20 +769,25 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         val currentTime = System.currentTimeMillis()
         val groupStateValueColIndex = valueSchema.fieldIndex("groupState")
         val groupStateValueSchema = valueSchema(groupStateValueColIndex).dataType.asInstanceOf[StructType]
-        val timeoutColIndex = groupStateValueSchema.fieldIndex(removeExpiredRowsInMaintenanceColName)
-        val stateIterator = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
-        stateIterator.foreach {
-          rowPair =>
-            if (!rowPair.value.isNullAt(groupStateValueColIndex)) {
-              val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
-              if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
-                val timeout = groupStateValueRow.getLong(timeoutColIndex)
-                if (timeout > 0 && timeout <= currentTime) {
-                  currentDb.delete(rowPair.key.getBytes)
-                  deleteCnt = deleteCnt + 1
+        if (!groupStateValueSchema.exists(_.name==removeExpiredRowsInMaintenanceColName)) {
+          logWarning(s"""removeExpiredRowsInMaintenanceColName $removeExpiredRowsInMaintenanceColName not found in groupState cols ${groupStateValueSchema.map(_.name).mkString(", ")}""")
+          removeExpiredRowsInMaintenance = false
+        } else {
+          val timeoutColIndex = groupStateValueSchema.fieldIndex(removeExpiredRowsInMaintenanceColName)
+          val stateIterator = RocksDbHelper.getIterator(currentDb, keySchema, valueSchema)
+          stateIterator.foreach {
+            rowPair =>
+              if (!rowPair.value.isNullAt(groupStateValueColIndex)) {
+                val groupStateValueRow = rowPair.value.getStruct(groupStateValueColIndex, groupStateValueSchema.size)
+                if (!groupStateValueRow.isNullAt(timeoutColIndex)) {
+                  val timeout = groupStateValueRow.getLong(timeoutColIndex)
+                  if (timeout > 0 && timeout <= currentTime) {
+                    currentDb.delete(rowPair.key.getBytes)
+                    deleteCnt = deleteCnt + 1
+                  }
                 }
               }
-            }
+          }
         }
       }
 
