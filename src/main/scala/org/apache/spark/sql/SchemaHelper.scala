@@ -30,15 +30,19 @@ object SchemaHelper extends Logging {
 
   case class CopyFieldProjector(name: String, srcIdx: Int, srcType: DataType ) extends FieldProjector {
     def get(inRow: InternalRow, topRow: InternalRow ): Any = {
-      inRow.get(srcIdx, srcType)
+      if (inRow==null) inRow
+      else inRow.get(srcIdx, srcType)
     }
   }
 
   case class StructTypeFieldProjector(name: String, srcIdx: Int, srcSchema: StructType, tgtSchema: StructType, defaultValues: Map[String,Expression], path: Seq[String] ) extends FieldProjector {
     private val projection = getSchemaProjectionInternal(srcSchema, tgtSchema, defaultValues, path)
     def get(inRow: InternalRow, topRow: InternalRow ): Any = {
-      val fieldRow = inRow.getStruct(srcIdx, srcSchema.size)
-      applySchemaProjection(fieldRow, topRow, projection)
+      if (inRow==null) inRow
+      else {
+        val fieldRow = inRow.getStruct(srcIdx, srcSchema.size)
+        applySchemaProjection(fieldRow, topRow, projection)
+      }
     }
   }
 
