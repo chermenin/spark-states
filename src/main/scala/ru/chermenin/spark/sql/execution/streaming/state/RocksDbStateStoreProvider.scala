@@ -493,7 +493,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   protected def restoreFromRemoteBackups(): Unit = {
     // copy backups from remote storage and init backup engine
     if (remoteBackupFm.exists(remoteBackupPath)) {
-      logDebug(s"loading state backup from remote filesystem $remoteBackupPath for $this")
+      logDebug(s"loading state backup with loadRemoteBackupSelective=$loadRemoteBackupSelective from remote filesystem $remoteBackupPath for $this")
 
       // cleanup possible existing local backup files
       // Note: deleting localBackupDir on Windows results in permission errors in unit tests... we do the cleanup only for linux for now
@@ -528,7 +528,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           case e: FileNotFoundException => logInfo(s"$remoteBackupSharedPath doesn't yet exist. It will be created on commit.")
         }
       }
-      logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs, existing backups versions are " + getBackupInfoVersionStr)
+      logInfo(s"got state backup from remote filesystem $remoteBackupPath for $this, took $t secs, existing backups versions are $getBackupInfoVersionStr with loadRemoteBackupSelective=$loadRemoteBackupSelective")
 
     } else {
       logDebug(s"initializing state backup at $remoteBackupPath for $this")
@@ -652,7 +652,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         , Option(keySchema).orElse(getBackupKeySchema(version)).get
         , Option(valueSchema).orElse(getBackupValueSchema(version)).get, cache)
     }
-    logInfo(s"Retrieved $currentStore for $this version $version, took $t seconds")
+    logInfo(s"Retrieved $currentStore for $this version $version with loadRemoteBackupSelective=$loadRemoteBackupSelective, took $t seconds")
     // return
     currentStore
   }
@@ -679,6 +679,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         val existingLocalSharedFiles = localBackupFs.listStatus(localBackupSharedPath).map(_.getPath.getName)
         val sharedFilesToCopy = neededSharedFiles.diff(existingLocalSharedFiles)
         loadRemoteSharedFiles(sharedFilesToCopy.map( sharedFileName => new Path(remoteBackupSharedPath, sharedFileName)), false)
+
+        logDebug(s"got remote backup selective for $this version $version")
       }
 
       // get infos about backup to recover
