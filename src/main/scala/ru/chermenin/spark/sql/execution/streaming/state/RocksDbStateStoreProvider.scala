@@ -572,8 +572,8 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
           // extract files from backup
           val filesCreated = MiscHelper.extractFromRemote(path, localBackupDir, remoteBackupFm, getHadoopFileBufferSize)
           // search for backupId in path
-          val escapedSeparator = File.separator+File.separator
-          val backupIdRegex = (s""".*${escapedSeparator}meta${escapedSeparator}([0-9]*)""").r
+          val unixOrWinSeparator = "[\\\\/]"
+          val backupIdRegex = (s""".*${unixOrWinSeparator}meta${unixOrWinSeparator}([0-9]*)""").r
           val backupId = filesCreated
             .collectFirst{
               case backupIdRegex(backupId) => backupId.toInt
