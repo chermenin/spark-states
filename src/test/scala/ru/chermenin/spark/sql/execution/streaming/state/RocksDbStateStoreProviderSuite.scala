@@ -146,7 +146,7 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
   test("StateStore.get") {
     val dir = newDir()
     val storeId = StateStoreProviderId(StateStoreId(dir, 0, 0), UUID.randomUUID)
-    val storeConf = StateStoreConf.empty
+    val storeConf = StateStoreConf( RocksDbStateStoreHelper.createSQLConf(-1, false))
     val hadoopConf = new Configuration()
 
     // Verify that trying to get incorrect versions throw errors

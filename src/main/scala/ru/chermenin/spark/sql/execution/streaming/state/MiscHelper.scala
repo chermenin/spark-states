@@ -8,6 +8,7 @@ import org.apache.commons.io.FileUtils
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 
+import scala.collection.mutable
 import scala.util.Random
 
 object MiscHelper {
@@ -54,31 +55,40 @@ object MiscHelper {
 
   /**
     * Load ZIP archive from HDFS and unzip files.
+    * Returns a list of created files
     */
-  def decompressFromRemote(archiveFile: Path, tgtPath: String, remoteBackupFm: CheckpointFileManager, bufferSize:Int): Unit = {
+  def extractFromRemote(archiveFile: Path, tgtPath: String, remoteBackupFm: CheckpointFileManager, bufferSize:Int): Seq[String] = {
     val buffer = new Array[Byte](bufferSize)
     val input = new ZipInputStream(remoteBackupFm.open(archiveFile))
+    val filesCreated = mutable.Buffer[String]()
     try {
       Iterator.continually(input.getNextEntry)
         .takeWhile(_ != null)
         .foreach(entry => {
           val file = new File(s"$tgtPath${File.separator}${entry.getName}")
-          file.getParentFile.mkdirs
-          val output = new FileOutputStream(file)
-          try {
-            Iterator.continually(input.read(buffer))
-              .takeWhile(_ != -1)
-              .filter(_ > 0)
-              .foreach(read =>
-                output.write(buffer, 0, read)
-              )
-          } finally {
-            output.close()
+          if (entry.isDirectory) {
+            file.mkdirs
+          } else {
+            file.getParentFile.mkdirs
+            val output = new FileOutputStream(file)
+            try {
+              Iterator.continually(input.read(buffer))
+                .takeWhile(_ != -1)
+                .filter(_ > 0)
+                .foreach(read =>
+                  output.write(buffer, 0, read)
+                )
+            } finally {
+              output.close()
+              filesCreated += file.getPath
+            }
           }
         })
     } finally {
       input.close()
     }
+    //return
+    filesCreated
   }
 
 
@@ -130,4 +140,15 @@ object MiscHelper {
     * check if running on Windows OS
     */
   def isWindowsOS = System.getProperty("os.name").toLowerCase.contains("windows")
+
+  /**
+    * retry operation on Exception for retryCntMax times
+    */
+  def retry(retryCntMax: Int, errText: String, logFunc: ( => String) => Unit, retryCnt: Int = 0 )(code: => Unit): Unit = try {
+    code
+  } catch {
+    case e:Exception if retryCnt < retryCntMax =>
+      logFunc(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' $errText")
+      retry( retryCntMax, errText, logFunc, retryCnt+1)(code)
+  }
 }
