@@ -151,4 +151,13 @@ object MiscHelper {
       logFunc(s"Error '${e.getClass.getSimpleName}: ${e.getMessage}' $errText")
       retry( retryCntMax, errText, logFunc, retryCnt+1)(code)
   }
+
+  /**
+    * "Loan pattern" to use & close a resource
+    */
+  def using[A <: { def close(): Unit }, B](resource: A)(f: A => B): B = try {
+    f(resource)
+  } finally {
+    resource.close()
+  }
 }
