@@ -975,7 +975,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       // diff needed vs existing files
       // note that we only need listStatus on remote filesystem if cleanRemoteBackups is enabled (performance!)
       val sharedFilesNeeded = remoteBackupInfos.values.flatMap(_.sharedFiles.map(_.getName)).toSeq.distinct
-      val sharedFilesExisting = remoteBackupFs.listStatus(localBackupSharedPath).map(_.getPath.getName).toSeq
+      val sharedFilesExisting = remoteBackupFs.listStatus(remoteBackupSharedPath).map(_.getPath.getName).toSeq
       val sharedFilesToDelete = sharedFilesExisting.diff(sharedFilesNeeded)
       // delete files no longer needed
       sharedFilesToDelete.foreach( f => remoteBackupFm.delete( new Path(remoteBackupSharedPath, f)))
