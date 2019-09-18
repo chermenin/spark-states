@@ -7,7 +7,7 @@
     <name>spark states</name>
     <groupId>ru.chermenin</groupId>
     <artifactId>spark-states_2.12</artifactId>
-    <version>0.9.7</version>
+    <version>0.9.8</version>
 
     <properties>
         <java.version>1.8</java.version>

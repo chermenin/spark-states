@@ -336,7 +336,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   }
 
   // case class to store informations about remote backups
-  case class RemoteBackupInfo(version: Long, tstamp: Long, path: Path, backupId: Option[Int] = None, sharedFiles: Seq[Path] = Seq())
+  case class RemoteBackupInfo(version: Long, tstamp: Long, path: Path, altPath: Seq[Path] = Seq(), backupId: Option[Int] = None, sharedFiles: Seq[Path] = Seq())
 
   /* Internal fields and methods */
   @volatile private var stateStoreId_ : StateStoreId = _
@@ -468,6 +468,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         //.setParanoidFileChecks(false) // use default for now
       writeOptions = new WriteOptions()
         .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
+        .setSync(false) // we call sync manually before commit points
       backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
         //.setInfoLog(rocksDbLogger) // this crashes
         .setShareTableFiles(true)
@@ -566,7 +567,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   def getLatestRemoteBackupInfos: Map[Long,RemoteBackupInfo] = {
     getRemoteBackupInfos
       .groupBy( _.version )
-      .mapValues( fs => fs.maxBy(_.tstamp)) // get entry with latest timestamp per group
+      .mapValues( backupInfos => {
+        val sortedBackupInfos = backupInfos.sortBy(_.tstamp).reverse
+        // enrich latest backup info with path from earlier backup infos if existing
+        sortedBackupInfos.head.copy( altPath = Try(sortedBackupInfos.tail).getOrElse(Seq()).map(_.path))
+      }) // get entry with latest timestamp per group
   }
 
   def getBackupInfoVersionStr: String = remoteBackupInfos.keys.toSeq.sorted.mkString(", ")
@@ -924,7 +929,7 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     ensureBackupSchemasUpToDate(version)
 
     // remember new remote backup
-    remoteBackupInfos.put(version, RemoteBackupInfo(version, tstamp, remoteBackupFile, Some(backupId), sharedFilesCurrentBackup))
+    remoteBackupInfos.put(version, RemoteBackupInfo(version, tstamp, remoteBackupFile, Seq(), Some(backupId), sharedFilesCurrentBackup))
 
     // delete old remote backups
     val remoteVersionsToDelete = remoteBackupInfos.keys.toSeq.sorted.dropRight(minRemoteVersionsToRetain)
@@ -962,7 +967,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       // delete remote version files
       versions.par.foreach { version =>
         remoteBackupInfos.get(version).foreach { backupInfo =>
+          // delete backup file of this version including possibly existing earlier files for this version (altPath)
           remoteBackupFm.delete(backupInfo.path)
+          backupInfo.altPath.foreach(remoteBackupFm.delete)
         }
       }
       // remove from remoteBackupInfos
