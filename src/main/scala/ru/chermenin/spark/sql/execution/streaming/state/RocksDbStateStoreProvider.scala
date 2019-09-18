@@ -462,17 +462,19 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         .setDisableAutoCompactions( manualRocksDbCompaction ) // if auto compactions is disabled, we trigger manual compaction during state maintenance with compactRange()
         .setWalDir(localWalDataDir) // Write-ahead-log should be saved on fast disk (local, not NAS...)
         .setCompressionType(setCompressionType(storeConf.confs))
+        .setAvoidFlushDuringRecovery(true) // Dont flush when opening database
         //.setCompactionStyle(CompactionStyle.UNIVERSAL) // use default normal Leveled compaction for now
         //.setParanoidChecks(false) // use default for now
         //.setForceConsistencyChecks(false) // use default for now
         //.setParanoidFileChecks(false) // use default for now
       writeOptions = new WriteOptions()
         .setDisableWAL(false) // we use write ahead log for efficient incremental state versioning
-        .setSync(false) // we call sync manually before commit points
+        .setSync(true)
       backupDBOptions = new BackupableDBOptions(localBackupDir.toString)
         //.setInfoLog(rocksDbLogger) // this crashes
         .setShareTableFiles(true)
         .setShareFilesWithChecksum(true)
+        .setBackupLogFiles(true)
         .setSync(true)
 
       // restore backups from remote to local directory
