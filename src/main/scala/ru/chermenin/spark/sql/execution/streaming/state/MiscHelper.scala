@@ -8,6 +8,7 @@ import org.apache.commons.io.FileUtils
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 
+import scala.collection.mutable
 import scala.util.Random
 
 object MiscHelper {
@@ -54,10 +55,12 @@ object MiscHelper {
 
   /**
     * Load ZIP archive from HDFS and unzip files.
+    * Returns a list of created files
     */
-  def decompressFromRemote(archiveFile: Path, tgtPath: String, remoteBackupFm: CheckpointFileManager, bufferSize:Int): Unit = {
+  def extractFromRemote(archiveFile: Path, tgtPath: String, remoteBackupFm: CheckpointFileManager, bufferSize:Int): Seq[String] = {
     val buffer = new Array[Byte](bufferSize)
     val input = new ZipInputStream(remoteBackupFm.open(archiveFile))
+    val filesCreated = mutable.Buffer[String]()
     try {
       Iterator.continually(input.getNextEntry)
         .takeWhile(_ != null)
@@ -77,12 +80,15 @@ object MiscHelper {
                 )
             } finally {
               output.close()
+              filesCreated += file.getPath
             }
           }
         })
     } finally {
       input.close()
     }
+    //return
+    filesCreated
   }
 
 
@@ -146,5 +152,12 @@ object MiscHelper {
       retry( retryCntMax, errText, logFunc, retryCnt+1)(code)
   }
 
-
+  /**
+    * "Loan pattern" to use & close a resource
+    */
+  def using[A <: { def close(): Unit }, B](resource: A)(f: A => B): B = try {
+    f(resource)
+  } finally {
+    resource.close()
+  }
 }
