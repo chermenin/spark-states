@@ -28,10 +28,12 @@ import org.scalatest.PrivateMethodTester
 import org.apache.spark.internal.Logging
 import oshi.SystemInfo
 import oshi.software.os.OperatingSystem
+import ru.chermenin.spark.sql.execution.streaming.state.MiscHelper.using
 
 import scala.util.Random
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.io.Source
 
 object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
 
@@ -69,12 +71,9 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
                           partition: Int,
                           dir: String = newDir().replace('\\','/'),
                           hadoopConf: Configuration = new Configuration,
-                          sqlConf: SQLConf = new SQLConf(),
+                          sqlConf: SQLConf = createSQLConf(-1, false),
                           keySchema: StructType = keySchema,
                           valueSchema: StructType = valueSchema): RocksDbStateStoreProvider = {
-    sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, batchesToRetain)
-    hadoopConf.set("spark.sql.streaming.checkpointFileManagerClass",
-      "ru.chermenin.spark.sql.execution.streaming.state.SimpleCheckpointFileManager")
     val provider = new RocksDbStateStoreProvider()
     provider.init(
       StateStoreId(dir, opId, partition),
@@ -89,25 +88,36 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
 
   def snapshot(version: Int): String = s"state.snapshot.$version"
 
+  /*
+   * Creates a new backup engine
+   * BackupEngine has to be closed manually after usage
+   */
+  private def createBackupEngine(provider: RocksDbStateStoreProvider) = {
+    val method = PrivateMethod[BackupEngine]('createBackupEngine)
+    provider invokePrivate method()
+  }
+
   def backupExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
-    val method = PrivateMethod[BackupEngine]('backupEngine)
-    val backupEngine = provider invokePrivate method()
-    backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
+    val backupEngine = createBackupEngine(provider)
+    val result = backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
+    backupEngine.close()
+    // return
+    result
   }
 
   def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Long): Unit = {
 
     // delete local backup
-    val backupEngineMethod = PrivateMethod[BackupEngine]('backupEngine)
-    val backupEngine = provider invokePrivate backupEngineMethod()
+    val backupEngine = createBackupEngine(provider)
     val backupId = backupEngine.getBackupInfo.asScala.find(_.appMetadata().toLong==version)
       .getOrElse(throw new IllegalStateException(s"Couldn't find backup for version $version"))
       .backupId
     backupEngine.deleteBackup(backupId)
+    backupEngine.close()
 
     // remove remote
     val cleanupRemoteBackupVersionsMethod = PrivateMethod[Unit]('cleanupRemoteBackupVersions)
-    provider invokePrivate cleanupRemoteBackupVersionsMethod( Seq((version,backupId)))
+    provider invokePrivate cleanupRemoteBackupVersionsMethod(Seq(version))
 
     logInfo( s"corrupted snapshot version $version, backupId $backupId")
   }
@@ -127,10 +137,10 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
   def createSQLConf(stateTTLSec: Long, isStrict: Boolean): SQLConf = {
     val sqlConf: SQLConf = new SQLConf()
 
-    sqlConf.setConfString("spark.sql.streaming.checkpointFileManagerClass",
-      "ru.chermenin.spark.sql.execution.streaming.state.SimpleCheckpointFileManager")
-    sqlConf.setConfString("spark.sql.streaming.stateStore.providerClass",
-      "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
+    sqlConf.setConfString("spark.sql.streaming.checkpointFileManagerClass", "ru.chermenin.spark.sql.execution.streaming.state.SimpleCheckpointFileManager")
+    sqlConf.setConf(SQLConf.STATE_STORE_PROVIDER_CLASS, "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
+
+    sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, batchesToRetain)
 
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, stateTTLSec.toString)
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_STRICT_MODE, isStrict.toString)
@@ -170,8 +180,7 @@ object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
     val commandString = s"ps -p $pid u"
     val cmd = Array("/bin/sh", "-c", commandString)
     val p = Runtime.getRuntime.exec(cmd)
-    val result = scala.io.Source.fromInputStream(p.getInputStream)
-    val resultParsedLines = result.getLines().toSeq.map(_.toLowerCase.split(" ").filter(!_.isEmpty))
+    val resultParsedLines = using(Source.fromInputStream(p.getInputStream))(_.getLines().toSeq.map(_.toLowerCase.split(" ").filter(!_.isEmpty)))
     val resultParsed = resultParsedLines.head.zip(resultParsedLines(1)).toMap
     val vsz = resultParsed("vsz").toLong
     val rss = resultParsed("rss").toLong

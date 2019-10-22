@@ -76,4 +76,27 @@ class RocksDbStateStoreMemorySuite extends FunSuite with BeforeAndAfter with Log
     logInfo(s"unit test took $t secs")
     assert(finalMem<=baseMem*1.1 + blockCacheSizeMb*SizeUnit.MB, s"Memory leak detected: baseProcessMemory=${formatBytes(baseMem)} finalProcessMemory=${formatBytes(finalMem)}")
   }
+
+  ignore("SST Files") {
+    import MiscHelper.formatBytes
+    val blockCacheSizeMb = 10 // fix global block cache to 10MB
+    val conf = new SQLConf()
+    conf.setConfString("spark.sql.streaming.stateStore.blockCacheSizeMb", blockCacheSizeMb.toString)
+    val provider = createStoreProvider(opId = math.abs(Random.nextInt), partition = 0, sqlConf = conf)
+    var currentVersion = 0
+
+    def simulateVersion(): Unit = {
+      val store = provider.getStore(currentVersion)
+      (1 to 1000).foreach { i =>
+        val k = Random.nextInt.toString
+        val v = get(store, k)
+        put(store, k, i)
+      }
+      store.commit()
+      currentVersion += 1
+      if (currentVersion % 3 == 0) provider.doMaintenance()
+    }
+
+    (1 to 10).foreach(_ => simulateVersion())
+  }
 }
