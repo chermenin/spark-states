@@ -4,6 +4,7 @@ import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.state.UnsafeRowPair
 import org.apache.spark.sql.types.StructType
 import org.rocksdb.RocksDB
+import ru.chermenin.spark.sql.execution.streaming.state.MiscHelper.using
 
 import scala.io.Source
 
@@ -11,8 +12,15 @@ object RocksDbHelper {
 
   def parseSharedFilesFromMetadata(backupDir: String, backupId: Int): Seq[String] = {
     val metaFile = backupDir + "/meta/" + backupId
+    parseSharedFilesFromMetadataFile( metaFile )
+  }
+
+  /**
+    * Parse the Metadata file of RocksDb Backup to extract shared files referenced by the backup
+    */
+  def parseSharedFilesFromMetadataFile(metaFile: String): Seq[String] = {
     val sstRegex = "[0-9_]*\\.sst".r
-    Source.fromFile(metaFile).getLines().flatMap( l => sstRegex.findFirstIn(l)).toList
+    using(Source.fromFile(metaFile))(_.getLines().flatMap( l => sstRegex.findFirstIn(l)).toList)
   }
 
   def getIterator(db: RocksDB, keySchema: StructType, valueSchema: StructType ): Iterator[UnsafeRowPair] = {
