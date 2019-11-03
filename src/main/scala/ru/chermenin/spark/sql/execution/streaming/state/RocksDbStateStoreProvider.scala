@@ -89,7 +89,6 @@ import scala.util.{Failure, Success, Try}
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
-
   /** Load native RocksDb library */
   RocksDB.loadLibrary()
 
@@ -319,6 +318,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var tempDir: String = _
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
+  @volatile private var expirationByQuery: Map[String, Int] = _
+  @volatile private var actualCheckpointRoot: String = _
+  @volatile private var queryName: String = _
 
   private def baseDir: Path = stateStoreId.storeCheckpointLocation()
 
@@ -349,7 +351,23 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
     this.tempDir = getTempDir(getTempPrefix(hadoopConf.get("spark.app.name")), "")
-    this.ttlSec = setTTL(storeConf.confs)
+    this.expirationByQuery = getExpirationByQuery(storeConf.confs)
+    this.actualCheckpointRoot =
+      stateStoreId.checkpointRootLocation.replaceAll("/state$", "")
+    this.queryName = {
+      val value = actualCheckpointRoot.split("/").last
+      if (expirationByQuery.contains(value)) value
+      else {
+        logWarning(
+          "An Unnamed Query encountered, default expiration will be applicable. " +
+            s"Default Expiration is '$DEFAULT_STATE_EXPIRY_SECS' i.e no timeout. " +
+            s"This can be overridden by setting SparkSession.conf.set($STATE_EXPIRY_SECS, ...)"
+        )
+        UNNAMED_QUERY
+      }
+    }
+
+    this.ttlSec = expirationByQuery(queryName)
     this.isStrictExpire = setExpireMode(storeConf.confs)
 
     fs.mkdirs(baseDir)
@@ -654,7 +672,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     })
   }
 
-
 }
 
 /**
@@ -680,6 +697,8 @@ object RocksDbStateStoreProvider {
 
   final val STATE_EXPIRY_STRICT_MODE: String = "spark.sql.streaming.stateStore.strictExpire"
 
+  final val UNNAMED_QUERY: String = "UNNAMED_QUERY"
+
   final val DEFAULT_STATE_EXPIRY_METHOD: String = "false"
 
   final val DUMMY_VALUE: String = ""
@@ -701,12 +720,35 @@ object RocksDbStateStoreProvider {
     cacheBuilderWithOptions.build[UnsafeRow, String](loader)
   }
 
-  private def setTTL(conf: Map[String, String]): Int =
+  private def getExpirationByQuery(stateStoreConf: Map[String, String]): Map[String, Int] =
+    stateStoreConf
+      .filter(_._1.startsWith(s"$STATE_EXPIRY_SECS."))
+      .map(
+        c => (c._1.replace(s"$STATE_EXPIRY_SECS.", ""), getTTL(c._2)
+        )
+      )
+      .+(
+        (
+          UNNAMED_QUERY,
+          stateStoreConf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt
+        ) // For backward compatibility
+      )
 
-    Try(conf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt) match {
-      case Success(value) => value
-      case Failure(e) => throw new IllegalArgumentException(e)
+
+  private def isInt(value: String): Option[Int] = {
+    Try(value.toInt) match {
+      case Success(v) => Some(v)
+      case Failure(_) => None
     }
+  }
+
+  private def getTTL(expirySecs: String): Int = isInt(expirySecs) match {
+    case Some(value) => value
+    case None =>
+      throw new IllegalArgumentException(
+        s"Provided value '$expirySecs' is invalid. Expiry Secs must be an Integer."
+      )
+  }
 
   private def setExpireMode(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(STATE_EXPIRY_STRICT_MODE, DEFAULT_STATE_EXPIRY_METHOD).toBoolean) match {
