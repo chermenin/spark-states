@@ -111,16 +111,17 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def size(store: StateStore): Long = store.iterator.size
 
-  def createSQLConf(stateTTLSec: Long, isStrict: Boolean): SQLConf = {
+  def createSQLConf(defaultTTL: Long = -1,
+                    isStrict: Boolean,
+                    configs: Map[String, String] = Map.empty): SQLConf = {
     val sqlConf: SQLConf = new SQLConf()
 
     sqlConf.setConfString("spark.sql.streaming.stateStore.providerClass",
       "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
 
-    sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, stateTTLSec.toString)
+    sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, defaultTTL.toString)
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_STRICT_MODE, isStrict.toString)
 
     sqlConf
   }
-
 }
