@@ -9,7 +9,33 @@ import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvide
 
 import scala.collection.mutable
 
+/**
+  * Implicits aka helper methods
+  *
+  * The can be imported into scope with ,
+  * import ru.chermenin.spark.sql.execution.streaming.state.implicits._
+  *
+  * SessionImplicits:
+  *   - Makes the `useRocksDBStateStore` method available on [[Builder]]
+  *   - Sets provider to [[RocksDbStateStoreProvider]]
+  *
+  * WriterImplicits:
+  *   - Makes the `stateTimeout` method available on [[DataStreamWriter]]
+  *   - Precedence is given to the provided arguments (if any), then previously set value,
+  *   and finally the value set on [[RuntimeConfig]] (in case of checkpoint location)
+  *   - Makes Checkpoint mandatory for all query on which applied
+  *   - Expiry Seconds less than 0 are treated as -1 (no timeout)
+  */
+
 object implicits extends Serializable {
+
+  implicit class SessionImplicits(sparkSessionBuilder: Builder) {
+
+    def useRocksDBStateStore(): Builder =
+      sparkSessionBuilder.config(SQLConf.STATE_STORE_PROVIDER_CLASS.key,
+        classOf[RocksDbStateStoreProvider].getCanonicalName)
+
+  }
 
   implicit class WriterImplicits[T](dsw: DataStreamWriter[T]) {
 
@@ -44,7 +70,7 @@ object implicits extends Serializable {
         .option("checkpointLocation", location)
     }
 
-    def getExtraOptions: mutable.HashMap[String, String] = {
+    private def getExtraOptions: mutable.HashMap[String, String] = {
       val className = classOf[DataStreamWriter[T]]
       val field = className.getDeclaredField("extraOptions")
       field.setAccessible(true)
@@ -52,14 +78,5 @@ object implicits extends Serializable {
       field.get(dsw).asInstanceOf[mutable.HashMap[String, String]]
     }
   }
-
-  implicit class SessionImplicits(sparkSessionBuilder: Builder) {
-
-    def useRocksDBStateStore(): Builder =
-      sparkSessionBuilder.config(SQLConf.STATE_STORE_PROVIDER_CLASS.key,
-        classOf[RocksDbStateStoreProvider].getCanonicalName)
-
-  }
-
 
 }
