@@ -14,6 +14,7 @@ Out of the box, Apache Spark has only one implementation of state store provider
 To use the custom state store provider for your pipelines use the following additional configuration for the submit script/ SparkConf:
 
     --conf spark.sql.streaming.stateStore.providerClass="ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider"
+
 Here is some more information about it: https://docs.databricks.com/spark/latest/structured-streaming/production.html
 
 Alternatively, you can use the `useRocksDBStateStore()` helper method in your application while creating the SparkSession,
@@ -23,6 +24,7 @@ import ru.chermenin.spark.sql.execution.streaming.state.implicits._
 
 val spark = SparkSession.builder().master(...).useRocksDBStateStore().getOrCreate()
 ```
+
 Note: For the helper methods to be available, you must import the implicits as shown above.
 
 
@@ -43,54 +45,52 @@ Important points to note when using State Timeouts,
  * Since the processing time timeout is based on the clock time, it is affected by the variations in the system clock (i.e. time zone changes, clock skew, etc.)
  * Timeout may or may not be set to strict expiration at the slight cost of memory. More info [here](https://github.com/chermenin/spark-states/issues/1).
     
-There are 2 different ways configure state timeout,
- 1) Via additional configuration on SparkConf,
+There are 2 different ways configure state timeout:
+
+1) Via additional configuration on SparkConf:
  
-    To set a processing time timeout for all streaming queries in strict mode.
+   To set a processing time timeout for all streaming queries in strict mode.
  
-    ```
     --conf spark.sql.streaming.stateStore.stateExpirySecs=5
     --conf spark.sql.streaming.stateStore.strictExpire=true
-    ```
         
-    To configure state timeout differently for each query the above configs can be modified to,
+   To configure state timeout differently for each query the above configs can be modified to,
      
-    ```
     --conf spark.sql.streaming.stateStore.stateExpirySecs.queryName1=5
     --conf spark.sql.streaming.stateStore.stateExpirySecs.queryName2=10
         ...
         ...
     --conf spark.sql.streaming.stateStore.strictExpire=true
-    ```
-2) Via `stateTimeout()` helper method _(recommended way)_,
 
-    ```
+2) Via `stateTimeout()` helper method _(recommended way)_:
+
     import ru.chermenin.spark.sql.execution.streaming.state.implicits._
+
+    val spark: SparkSession = ...
+    val streamingDF: DataFrame = ...
+
+    streamingDF.writeStream
+          .format(...)
+          .outputMode(...)
+          .trigger(Trigger.ProcessingTime(1000L))
+          .queryName("myQuery1")
+          .option("checkpointLocation", "chkpntloc")
+          .stateTimeout(spark.conf, expirySecs = 5)
+          .start()
    
-   val spark: SparkSession = ...
-   val streamingDF: DataFrame = ...
-   
-   streamingDF.writeStream
-         .format(...)
-         .outputMode(...)
-         .trigger(Trigger.ProcessingTime(1000L))
-         .queryName("myQuery1")
-         .option("checkpointLocation", "chkpntloc")
-         .stateTimeout(spark.conf, expirySecs = 5)
-         .start()
-   
-   spark.streams.awaitAnyTermination()
-    ```
-   Preferably, the `queryName` and `checkpointLocation` can be set directly via the `stateTimeout()` method, as below,
-   ```
-   streamingDF.writeStream
-        .format(...)
-        .outputMode(...)
-        .trigger(Trigger.ProcessingTime(1000L))
-        .stateTimeout(spark.conf, queryName="myQuery1", expirySecs = 5, checkpointLocation ="chkpntloc")
-        .start()
-   ```
-Note: If `queryName` is invalid/ unavailable, the streaming query will be tagged as `UN_NAMED` and timeout applicable will be as per the value of `spark.sql.streaming.stateStore.stateExpirySecs` (which defaults to -1, but can be overridden via SparkConf) 
+    spark.streams.awaitAnyTermination()
+
+   Preferably, the `queryName` and `checkpointLocation` can be set directly via the `stateTimeout()` method, as below:
+
+    streamingDF.writeStream
+          .format(...)
+          .outputMode(...)
+          .trigger(Trigger.ProcessingTime(1000L))
+          .stateTimeout(spark.conf, queryName="myQuery1", expirySecs = 5, checkpointLocation ="chkpntloc")
+          .start()
+
+Note: If `queryName` is invalid/ unavailable, the streaming query will be tagged as `UNNAMED` and timeout applicable will be as per the value of `spark.sql.streaming.stateStore.stateExpirySecs` (which defaults to -1, but can be overridden via SparkConf) 
+
 Other state timeout related points (applicable on global and query level),
  * For no timeout, i.e. infinite state, set `spark.sql.streaming.stateStore.stateExpirySecs=-1`
  * For stateless processing, i.e. no state, set `spark.sql.streaming.stateStore.stateExpirySecs=0`
