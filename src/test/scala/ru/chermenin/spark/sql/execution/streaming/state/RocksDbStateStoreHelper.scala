@@ -26,6 +26,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 import org.scalatest.PrivateMethodTester
 
+import scala.reflect.io.Path._
 import scala.util.Random
 
 object RocksDbStateStoreHelper extends PrivateMethodTester {
@@ -99,7 +100,13 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def minSnapshotToRetain(version: Int): Int = version - batchesToRetain + 1
 
-  def clearDB(file: File): Unit = {
+  def performCleanUp(pathSlice: String): Unit = {
+    ".".toDirectory.dirs
+      .filter(_.name.contains(pathSlice))
+      .foreach(x => clearDB(x.jfile))
+  }
+
+  private def clearDB(file: File): Unit = {
     if (file.isDirectory)
       file.listFiles.foreach(clearDB)
     if (file.exists && !file.delete)

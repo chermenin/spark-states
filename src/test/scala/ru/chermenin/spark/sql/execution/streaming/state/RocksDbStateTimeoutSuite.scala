@@ -27,7 +27,6 @@ import org.apache.spark.sql.internal.SQLConf
 import org.scalatest.{BeforeAndAfter, FunSuite}
 import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider.{DUMMY_VALUE, MapType}
 
-import scala.reflect.io.Path._
 import scala.util.Random
 
 /**
@@ -53,18 +52,14 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
 
-    ".".toDirectory.dirs
-      .filter(_.name.contains(testDBLocation))
-      .foreach(x => clearDB(x.jfile))
+    performCleanUp(testDBLocation)
   }
 
   after {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
 
-    ".".toDirectory.dirs
-      .filter(_.name.contains(testDBLocation))
-      .foreach(x => clearDB(x.jfile))
+    performCleanUp(testDBLocation)
   }
 
   test("no timeout") {

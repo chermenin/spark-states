@@ -738,17 +738,9 @@ object RocksDbStateStoreProvider {
 
   private def getExpirationByQuery(stateStoreConf: Map[String, String]): Map[String, Int] =
     stateStoreConf
-      .filter(_._1.startsWith(s"$STATE_EXPIRY_SECS."))
-      .map(
-        c => (c._1.replace(s"$STATE_EXPIRY_SECS.", ""), getTTL(c._2)
-        )
-      )
-      .+(
-        (
-          UNNAMED_QUERY,
-          stateStoreConf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt
-        ) // For backward compatibility
-      )
+      .filterKeys(_.startsWith(s"$STATE_EXPIRY_SECS."))
+      .map { case (key, value) => key.replace(s"$STATE_EXPIRY_SECS.", "") -> getTTL(value) }
+      .+(UNNAMED_QUERY -> stateStoreConf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt)
 
   /**
     * Helper method to check if the given string is an integer
@@ -756,14 +748,14 @@ object RocksDbStateStoreProvider {
     * @param value [[String]] value to be checked
     * @return [[Option]] if value is not an integer returns [[None]] else [[Some]]
     */
-  private def isInt(value: String): Option[Int] = {
+  private def toInt(value: String): Option[Int] = {
     Try(value.toInt) match {
       case Success(v) => Some(v)
       case Failure(_) => None
     }
   }
 
-  private def getTTL(expirySecs: String): Int = isInt(expirySecs) match {
+  private def getTTL(expirySecs: String): Int = toInt(expirySecs) match {
     case Some(value) => value
     case None =>
       throw new IllegalArgumentException(
