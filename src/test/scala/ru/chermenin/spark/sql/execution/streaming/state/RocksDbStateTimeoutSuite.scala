@@ -16,7 +16,6 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.File
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 
 import com.google.common.base.Ticker
@@ -41,8 +40,9 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
 
   final val testDBLocation: String = "testdb"
 
-  def withTTLStore(ttl: Long, sqlConf: SQLConf)(f: (FakeTicker, StateStore) => Unit): Unit = {
-    val stateStore = createTTLStore(ttl, sqlConf)
+  def withTTLStore(ttl: Long, sqlConf: SQLConf, pathSuffix: String = "")
+                  (f: (FakeTicker, StateStore) => Unit): Unit = {
+    val stateStore = createTTLStore(ttl, sqlConf, testDBLocation + pathSuffix)
 
     f(stateStore._1, stateStore._2)
     stateStore._2.commit()
@@ -52,13 +52,14 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
 
-    clearDB(new File(testDBLocation))
+    performCleanUp(testDBLocation)
   }
 
   after {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
-    clearDB(new File(testDBLocation))
+
+    performCleanUp(testDBLocation)
   }
 
   test("no timeout") {
@@ -168,7 +169,77 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
     })
   }
 
-  private def createTTLStore(ttl: Long, sqlConf: SQLConf): (FakeTicker, StateStore) = {
+  test("different timeouts for each streaming query (states)") {
+    // Each query creates its own state store, the SQLConf is the same
+    import RocksDbStateStoreProvider.STATE_EXPIRY_SECS
+    val query1 = "query1"
+    val timeout1 = 3
+
+    val query2 = "query2"
+    val timeout2 = 5
+
+    val sqlConf = createSQLConf(isStrict = true, configs = Map(
+      s"$STATE_EXPIRY_SECS.$query1" -> s"$timeout1",
+      s"$STATE_EXPIRY_SECS.$query2" -> s"$timeout2"
+    ))
+
+    withTTLStore(timeout1, sqlConf, "1")((ticker1, store1) => {
+      withTTLStore(timeout2, sqlConf, "2")((ticker2, store2) => {
+
+        // Same data is read by both queries
+        put(store1, "k1", 1)
+        put(store1, "k2", 1)
+        put(store2, "k1", 1)
+        put(store2, "k2", 1)
+
+        assert(size(store1) === 2)
+        assert(contains(store1, "k1"))
+        assert(contains(store1, "k2"))
+
+        assert(size(store2) === 2)
+        assert(contains(store2, "k1"))
+        assert(contains(store2, "k2"))
+
+        // Clock progression is the same for both queries
+        ticker1.advance(2, TimeUnit.SECONDS)
+        ticker2.advance(2, TimeUnit.SECONDS)
+
+        assert(size(store1) === 2)
+        assert(contains(store1, "k1"))
+        assert(contains(store1, "k2"))
+
+        assert(size(store2) === 2)
+        assert(contains(store2, "k1"))
+        assert(contains(store2, "k2"))
+
+        ticker1.advance(1, TimeUnit.SECONDS) // deadline met for query1
+        ticker2.advance(1, TimeUnit.SECONDS)
+
+        assert(size(store1) === 0)
+        assert(!contains(store1, "k1"))
+        assert(!contains(store1, "k2"))
+
+        assert(size(store2) === 2)
+        assert(contains(store2, "k1"))
+        assert(contains(store2, "k2"))
+
+        ticker1.advance(2, TimeUnit.SECONDS)
+        ticker2.advance(2, TimeUnit.SECONDS) // deadline met for query2
+
+        assert(size(store1) === 0)
+        assert(!contains(store1, "k1"))
+        assert(!contains(store1, "k2"))
+
+        assert(size(store2) === 0)
+        assert(!contains(store2, "k1"))
+        assert(!contains(store2, "k2"))
+
+
+      })
+    })
+  }
+
+  private def createTTLStore(ttl: Long, sqlConf: SQLConf, dbPath: String): (FakeTicker, StateStore) = {
 
     def createMockCache(ttl: Long, ticker: Ticker): MapType = {
       val loader = new CacheLoader[UnsafeRow, String] {
@@ -193,7 +264,7 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
     val cache = createMockCache(ttl, ticker)
 
     val provider = createStoreProvider(opId = Random.nextInt(), partition = Random.nextInt(), sqlConf = sqlConf)
-    val store = new provider.RocksDbStateStore(0, testDBLocation, keySchema, valueSchema, new ConcurrentHashMap, cache)
+    val store = new provider.RocksDbStateStore(0, dbPath, keySchema, valueSchema, new ConcurrentHashMap, cache)
 
     (ticker, store)
   }

@@ -26,6 +26,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 import org.scalatest.PrivateMethodTester
 
+import scala.reflect.io.Path._
 import scala.util.Random
 
 object RocksDbStateStoreHelper extends PrivateMethodTester {
@@ -99,7 +100,13 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def minSnapshotToRetain(version: Int): Int = version - batchesToRetain + 1
 
-  def clearDB(file: File): Unit = {
+  def performCleanUp(pathSlice: String): Unit = {
+    ".".toDirectory.dirs
+      .filter(_.name.contains(pathSlice))
+      .foreach(x => clearDB(x.jfile))
+  }
+
+  private def clearDB(file: File): Unit = {
     if (file.isDirectory)
       file.listFiles.foreach(clearDB)
     if (file.exists && !file.delete)
@@ -111,16 +118,17 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def size(store: StateStore): Long = store.iterator.size
 
-  def createSQLConf(stateTTLSec: Long, isStrict: Boolean): SQLConf = {
+  def createSQLConf(defaultTTL: Long = -1,
+                    isStrict: Boolean,
+                    configs: Map[String, String] = Map.empty): SQLConf = {
     val sqlConf: SQLConf = new SQLConf()
 
     sqlConf.setConfString("spark.sql.streaming.stateStore.providerClass",
       "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
 
-    sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, stateTTLSec.toString)
+    sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, defaultTTL.toString)
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_STRICT_MODE, isStrict.toString)
 
     sqlConf
   }
-
 }

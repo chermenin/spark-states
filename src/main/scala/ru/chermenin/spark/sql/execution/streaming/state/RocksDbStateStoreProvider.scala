@@ -25,6 +25,7 @@ import java.util.zip.{ZipEntry, ZipInputStream, ZipOutputStream}
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
+import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.streaming.state._
@@ -77,18 +78,22 @@ import scala.util.{Failure, Success, Try}
   *
   * Timeout Modes:
   *  - In non strict mode (default), this guarantees that key-values inserted will remain in the db
-  *    for >= ttl amount of time and the db will make efforts to remove the key-values
-  *    as soon as possible after ttl seconds of their insertion.
+  * for >= ttl amount of time and the db will make efforts to remove the key-values
+  * as soon as possible after ttl seconds of their insertion.
   *  - In strict mode, the key-values inserted will remain in the db for exactly ttl amount of time.
-  *    To ensure exact expiration, a separate cache of keys is maintained in memory with
-  *    their respective deadlines and is used for reference during operations.
+  * To ensure exact expiration, a separate cache of keys is maintained in memory with
+  * their respective deadlines and is used for reference during operations.
   *
-  * This API can be used to allow,
+  * The timeouts may be set on global (for all queries) for differently for each streaming query.
+  * This can be done be appending the query name to [[STATE_EXPIRY_SECS]], like below,
+  *
+  * spark.sql.streaming.stateStore.stateExpirySecs.queryName1 = 5
+  *
+  * This API can also be used to allow,
   *  - Stateless Processing - set timeout to 0
   *  - Infinite State (no timeout) - set timeout to -1, which is set by default.
   */
 class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
-
 
   /** Load native RocksDb library */
   RocksDB.loadLibrary()
@@ -319,6 +324,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
   @volatile private var tempDir: String = _
   @volatile private var ttlSec: Int = _
   @volatile private var isStrictExpire: Boolean = _
+  @volatile private var expirationByQuery: Map[String, Int] = _
+  @volatile private var actualCheckpointRoot: String = _
+  @volatile private var queryName: String = _
 
   private def baseDir: Path = stateStoreId.storeCheckpointLocation()
 
@@ -349,7 +357,23 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     this.storeConf = storeConf
     this.hadoopConf = hadoopConf
     this.tempDir = getTempDir(getTempPrefix(hadoopConf.get("spark.app.name")), "")
-    this.ttlSec = setTTL(storeConf.confs)
+    this.expirationByQuery = getExpirationByQuery(storeConf.confs)
+    this.actualCheckpointRoot =
+      stateStoreId.checkpointRootLocation.replaceAll("/state$", "")
+    this.queryName = {
+      val value = actualCheckpointRoot.split("/").last
+      if (expirationByQuery.contains(value)) value
+      else {
+        logWarning(
+          "An Unnamed Query encountered, default expiration will be applicable. " +
+            s"Default Expiration is '$DEFAULT_STATE_EXPIRY_SECS' i.e no timeout. " +
+            s"This can be overridden by setting SparkSession.conf.set($STATE_EXPIRY_SECS, ...)"
+        )
+        UNNAMED_QUERY
+      }
+    }
+
+    this.ttlSec = expirationByQuery(queryName)
     this.isStrictExpire = setExpireMode(storeConf.confs)
 
     fs.mkdirs(baseDir)
@@ -654,7 +678,6 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
     })
   }
 
-
 }
 
 /**
@@ -680,6 +703,8 @@ object RocksDbStateStoreProvider {
 
   final val STATE_EXPIRY_STRICT_MODE: String = "spark.sql.streaming.stateStore.strictExpire"
 
+  final val UNNAMED_QUERY: String = "UNNAMED_QUERY"
+
   final val DEFAULT_STATE_EXPIRY_METHOD: String = "false"
 
   final val DUMMY_VALUE: String = ""
@@ -701,12 +726,42 @@ object RocksDbStateStoreProvider {
     cacheBuilderWithOptions.build[UnsafeRow, String](loader)
   }
 
-  private def setTTL(conf: Map[String, String]): Int =
+  /**
+    * Creates a mapping of Streaming Query and its expiry timeout (seconds).
+    * For backward compatibility, an additional entry is done for [[UNNAMED_QUERY]]'s
+    *
+    * The timeout value for [[UNNAMED_QUERY]]'s is set by the value of [[STATE_EXPIRY_SECS]]
+    *
+    * @param stateStoreConf state store config map set on [[SparkConf]]
+    * @return mapping of queryName -> expirySecs
+    */
 
-    Try(conf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt) match {
-      case Success(value) => value
-      case Failure(e) => throw new IllegalArgumentException(e)
+  private def getExpirationByQuery(stateStoreConf: Map[String, String]): Map[String, Int] =
+    stateStoreConf
+      .filterKeys(_.startsWith(s"$STATE_EXPIRY_SECS."))
+      .map { case (key, value) => key.replace(s"$STATE_EXPIRY_SECS.", "") -> getTTL(value) }
+      .+(UNNAMED_QUERY -> stateStoreConf.getOrElse(STATE_EXPIRY_SECS, DEFAULT_STATE_EXPIRY_SECS).toInt)
+
+  /**
+    * Helper method to check if the given string is an integer
+    *
+    * @param value [[String]] value to be checked
+    * @return [[Option]] if value is not an integer returns [[None]] else [[Some]]
+    */
+  private def toInt(value: String): Option[Int] = {
+    Try(value.toInt) match {
+      case Success(v) => Some(v)
+      case Failure(_) => None
     }
+  }
+
+  private def getTTL(expirySecs: String): Int = toInt(expirySecs) match {
+    case Some(value) => value
+    case None =>
+      throw new IllegalArgumentException(
+        s"Provided value '$expirySecs' is invalid. Expiry Secs must be an Integer."
+      )
+  }
 
   private def setExpireMode(conf: Map[String, String]): Boolean =
     Try(conf.getOrElse(STATE_EXPIRY_STRICT_MODE, DEFAULT_STATE_EXPIRY_METHOD).toBoolean) match {
