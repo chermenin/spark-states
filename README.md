@@ -47,47 +47,52 @@ Important points to note when using State Timeouts,
     
 There are 2 different ways configure state timeout:
 
-1) Via additional configuration on SparkConf:
+1. Via additional configuration on SparkConf:
  
    To set a processing time timeout for all streaming queries in strict mode.
- 
-    --conf spark.sql.streaming.stateStore.stateExpirySecs=5
-    --conf spark.sql.streaming.stateStore.strictExpire=true
-        
+   ```
+   --conf spark.sql.streaming.stateStore.stateExpirySecs=5
+   --conf spark.sql.streaming.stateStore.strictExpire=true
+   ```
+
    To configure state timeout differently for each query the above configs can be modified to,
-     
-    --conf spark.sql.streaming.stateStore.stateExpirySecs.queryName1=5
-    --conf spark.sql.streaming.stateStore.stateExpirySecs.queryName2=10
-        ...
-        ...
-    --conf spark.sql.streaming.stateStore.strictExpire=true
+   ```
+   --conf spark.sql.streaming.stateStore.stateExpirySecs.queryName1=5
+   --conf spark.sql.streaming.stateStore.stateExpirySecs.queryName2=10
+       ...
+       ...
+   --conf spark.sql.streaming.stateStore.strictExpire=true
+   ```
 
-2) Via `stateTimeout()` helper method _(recommended way)_:
+2. Via `stateTimeout()` helper method _(recommended way)_:
 
-    import ru.chermenin.spark.sql.execution.streaming.state.implicits._
+   ```
+   import ru.chermenin.spark.sql.execution.streaming.state.implicits._
 
-    val spark: SparkSession = ...
-    val streamingDF: DataFrame = ...
+   val spark: SparkSession = ...
+   val streamingDF: DataFrame = ...
 
-    streamingDF.writeStream
-          .format(...)
-          .outputMode(...)
-          .trigger(Trigger.ProcessingTime(1000L))
-          .queryName("myQuery1")
-          .option("checkpointLocation", "chkpntloc")
-          .stateTimeout(spark.conf, expirySecs = 5)
-          .start()
+   streamingDF.writeStream
+         .format(...)
+         .outputMode(...)
+         .trigger(Trigger.ProcessingTime(1000L))
+         .queryName("myQuery1")
+         .option("checkpointLocation", "chkpntloc")
+         .stateTimeout(spark.conf, expirySecs = 5)
+         .start()
    
-    spark.streams.awaitAnyTermination()
-
+   spark.streams.awaitAnyTermination()
+   ```
+   
    Preferably, the `queryName` and `checkpointLocation` can be set directly via the `stateTimeout()` method, as below:
-
-    streamingDF.writeStream
-          .format(...)
-          .outputMode(...)
-          .trigger(Trigger.ProcessingTime(1000L))
-          .stateTimeout(spark.conf, queryName="myQuery1", expirySecs = 5, checkpointLocation ="chkpntloc")
-          .start()
+   ```
+   streamingDF.writeStream
+         .format(...)
+         .outputMode(...)
+         .trigger(Trigger.ProcessingTime(1000L))
+         .stateTimeout(spark.conf, queryName="myQuery1", expirySecs = 5, checkpointLocation ="chkpntloc")
+         .start()
+   ```
 
 Note: If `queryName` is invalid/ unavailable, the streaming query will be tagged as `UNNAMED` and timeout applicable will be as per the value of `spark.sql.streaming.stateStore.stateExpirySecs` (which defaults to -1, but can be overridden via SparkConf) 
 
