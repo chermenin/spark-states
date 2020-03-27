@@ -16,22 +16,19 @@
 
 name := "spark-states"
 
-version := "0.1"
+version := "0.2"
 
-crossScalaVersions := Seq("2.11.12", "2.12.7")
-
-val sparkVersion = "2.4.3"
-val rocksDbVersion = "5.18.3"
+crossScalaVersions := Seq(Versions.Scala_2_11, Versions.Scala_2_12)
 
 libraryDependencies ++= Seq(
 
   // general dependencies
-  "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
-  "org.apache.spark" %% "spark-streaming" % sparkVersion % "provided",
-  "org.rocksdb" % "rocksdbjni" % rocksDbVersion,
+  "org.apache.spark" %% "spark-sql" % Versions.Spark % "provided",
+  "org.apache.spark" %% "spark-streaming" % Versions.Spark % "provided",
+  "org.rocksdb" % "rocksdbjni" % Versions.RocksDb,
 
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
-  "org.apache.spark" %% "spark-sql" % sparkVersion % "test" classifier "tests",
+  "org.apache.spark" %% "spark-sql" % Versions.Spark % "test" classifier "tests",
   "com.google.guava" % "guava-testlib" % "14.0.1" % "test"
 )
