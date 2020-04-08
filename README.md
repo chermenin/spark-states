@@ -2,6 +2,7 @@
 
 [![Build Status](https://travis-ci.org/chermenin/spark-states.svg?branch=master)](https://travis-ci.org/chermenin/spark-states)
 [![CodeFactor](https://www.codefactor.io/repository/github/chermenin/spark-states/badge)](https://www.codefactor.io/repository/github/chermenin/spark-states)
+[![Maven Central](https://img.shields.io/maven-central/v/ru.chermenin/spark-states_2.12.svg)](https://search.maven.org/artifact/ru.chermenin/spark-states_2.12)
 
 State management extensions for Apache Spark to keep data across micro-batches during stateful stream processing.
 
