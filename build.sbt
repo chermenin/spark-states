@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+organization := "ru.chermenin"
 name := "spark-states"
-
 version := "0.2"
+
+description := "Custom state store providers for Apache Spark"
+homepage := Some(url("http://code.chermenin.ru/spark-states/"))
 
 crossScalaVersions := Seq(Versions.Scala_2_11, Versions.Scala_2_12)
 
@@ -31,4 +34,31 @@ libraryDependencies ++= Seq(
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
   "org.apache.spark" %% "spark-sql" % Versions.Spark % "test" classifier "tests",
   "com.google.guava" % "guava-testlib" % "14.0.1" % "test"
+)
+
+scmInfo := Some(
+  ScmInfo(
+    url("https://github.com/chermenin/spark-states"),
+    "git@github.com:chermenin/spark-states.git"
+  )
+)
+
+developers := List(
+  Developer(
+    "chermenin",
+    "Alex Chermenin",
+    "alex@chermenin.ru",
+    url("https://chermenin.ru")
+  )
+)
+
+licenses += ("Apache-2.0", url("http://www.apache.org/licenses/LICENSE-2.0"))
+
+publishMavenStyle := true
+
+publishTo := Some(
+  if (isSnapshot.value)
+    Opts.resolver.sonatypeSnapshots
+  else
+    Opts.resolver.sonatypeStaging
 )
