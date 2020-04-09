@@ -264,7 +264,7 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
     val cache = createMockCache(ttl, ticker)
 
     val provider = createStoreProvider(opId = Random.nextInt(), partition = Random.nextInt(), sqlConf = sqlConf)
-    val store = new provider.RocksDbStateStore(0, dbPath, keySchema, valueSchema, new ConcurrentHashMap, cache)
+    val store = provider.getStore(0, cache)
 
     (ticker, store)
   }

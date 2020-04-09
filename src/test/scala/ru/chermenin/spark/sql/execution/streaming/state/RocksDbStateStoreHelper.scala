@@ -16,20 +16,27 @@
 
 package ru.chermenin.spark.sql.execution.streaming.state
 
-import java.io.File
+import java.lang.management.ManagementFactory
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper.{newDir, rowsToStringInt, stringToRow}
 import org.apache.spark.sql.execution.streaming.state.{StateStore, StateStoreConf, StateStoreId}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
+import org.rocksdb.BackupEngine
 import org.scalatest.PrivateMethodTester
+import org.apache.spark.internal.Logging
+import oshi.SystemInfo
+import oshi.software.os.OperatingSystem
+import ru.chermenin.spark.sql.execution.streaming.state.MiscHelper.using
 
 import scala.reflect.io.Path._
 import scala.util.Random
+import scala.collection.JavaConverters._
+import scala.collection.mutable
+import scala.io.Source
 
-object RocksDbStateStoreHelper extends PrivateMethodTester {
+object RocksDbStateStoreHelper extends PrivateMethodTester with Logging {
 
   val keySchema = StructType(Seq(StructField("key", StringType, nullable = true)))
   val valueSchema = StructType(Seq(StructField("value", IntegerType, nullable = true)))
@@ -53,7 +60,7 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
   }
 
   def getData(provider: RocksDbStateStoreProvider, version: Int = -1): Set[(String, Int)] = {
-    val reloadedProvider = newStoreProvider(provider.stateStoreId)
+    val reloadedProvider = newStoreProvider(provider.stateStoreId.copy(storeName="getData"))
     if (version < 0) {
       reloadedProvider.latestIterator().map(rowsToStringInt).toSet
     } else {
@@ -63,12 +70,11 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def createStoreProvider(opId: Int,
                           partition: Int,
-                          dir: String = newDir(),
+                          dir: String = newDir().replace('\\','/'),
                           hadoopConf: Configuration = new Configuration,
-                          sqlConf: SQLConf = new SQLConf(),
+                          sqlConf: SQLConf = createSQLConf(-1, false),
                           keySchema: StructType = keySchema,
                           valueSchema: StructType = valueSchema): RocksDbStateStoreProvider = {
-    sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, batchesToRetain)
     val provider = new RocksDbStateStoreProvider()
     provider.init(
       StateStoreId(dir, opId, partition),
@@ -83,19 +89,43 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
   def snapshot(version: Int): String = s"state.snapshot.$version"
 
-  def fileExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
-    val method = PrivateMethod[Path]('baseDir)
-    val basePath = provider invokePrivate method()
-    val fileName = snapshot(version)
-    val filePath = new File(basePath.toString, fileName)
-    filePath.exists
+  /*
+   * Creates a new backup engine
+   * BackupEngine has to be closed manually after usage
+   */
+  private def createBackupEngine(provider: RocksDbStateStoreProvider) = {
+    val method = PrivateMethod[BackupEngine]('createBackupEngine)
+    provider invokePrivate method()
   }
 
-  def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Int): Unit = {
-    val method = PrivateMethod[Path]('baseDir)
-    val basePath = provider invokePrivate method()
-    val fileName = snapshot(version)
-    new File(basePath.toString, fileName).delete()
+  def backupExists(provider: RocksDbStateStoreProvider, version: Int): Boolean = {
+    val backupEngine = createBackupEngine(provider)
+    val result = backupEngine.getBackupInfo.asScala.exists(_.appMetadata.toLong==version)
+    backupEngine.close()
+    // return
+    result
+  }
+
+  def corruptSnapshot(provider: RocksDbStateStoreProvider, version: Long): Unit = {
+
+    // delete local backup
+    val backupEngine = createBackupEngine(provider)
+    val backupId = backupEngine.getBackupInfo.asScala.find(_.appMetadata().toLong==version)
+      .getOrElse(throw new IllegalStateException(s"Couldn't find backup for version $version"))
+      .backupId
+    backupEngine.deleteBackup(backupId)
+    backupEngine.close()
+
+    // remove remote
+    val cleanupRemoteBackupVersionsMethod = PrivateMethod[Unit]('cleanupRemoteBackupVersions)
+    provider invokePrivate cleanupRemoteBackupVersionsMethod(Seq(version))
+
+    logInfo( s"corrupted snapshot version $version, backupId $backupId")
+  }
+
+  def getProviderPrivateProperty[T](provider: RocksDbStateStoreProvider, property: Symbol): T = {
+    val method = PrivateMethod[T](property)
+    provider invokePrivate method()
   }
 
   def minSnapshotToRetain(version: Int): Int = version - batchesToRetain + 1
@@ -123,12 +153,56 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
                     configs: Map[String, String] = Map.empty): SQLConf = {
     val sqlConf: SQLConf = new SQLConf()
 
-    sqlConf.setConfString("spark.sql.streaming.stateStore.providerClass",
-      "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
+    sqlConf.setConfString("spark.sql.streaming.checkpointFileManagerClass", "ru.chermenin.spark.sql.execution.streaming.state.SimpleCheckpointFileManager")
+    sqlConf.setConf(SQLConf.STATE_STORE_PROVIDER_CLASS, "ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvider")
+
+    sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, batchesToRetain)
 
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, defaultTTL.toString)
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_STRICT_MODE, isStrict.toString)
 
     sqlConf
+  }
+
+  private lazy val memoryMXBean = ManagementFactory.getMemoryMXBean
+  private lazy val mBeanServer = ManagementFactory.getPlatformMBeanServer
+  private lazy val pid = ManagementFactory.getRuntimeMXBean.getName.split("@")(0)
+
+  /**
+    * get memory from jvm view
+    */
+  def getJavaMemoryUsage: Map[String,Long] = {
+    val heap = memoryMXBean.getHeapMemoryUsage
+    val nonHeap = memoryMXBean.getNonHeapMemoryUsage
+    Map(
+      "heapMemoryUsed" -> heap.getUsed,
+      "heapMemoryCommitted" -> heap.getCommitted,
+      "heapMemoryMax" -> heap.getMax,
+      "nonheapMemoryUsed" -> nonHeap.getUsed,
+      "nonheapMemoryCommitted" -> nonHeap.getCommitted,
+      "nonheapMemoryMax" -> nonHeap.getMax
+    )
+  }
+
+  /**
+    * get memory of process from OS view for Windows
+    */
+  lazy val osInfo: OperatingSystem = new SystemInfo().getOperatingSystem()
+  def getWindowsProcessMemoryUsage : Long = {
+    osInfo.getProcess(osInfo.getProcessId).getResidentSetSize
+  }
+
+  def getLinuxProcessMemoryUsage: Map[String,Long] = {
+    val commandString = s"ps -p $pid u"
+    val cmd = Array("/bin/sh", "-c", commandString)
+    val p = Runtime.getRuntime.exec(cmd)
+    val resultParsedLines = using(Source.fromInputStream(p.getInputStream))(_.getLines().toSeq.map(_.toLowerCase.split(" ").filter(!_.isEmpty)))
+    val resultParsed = resultParsedLines.head.zip(resultParsedLines(1)).toMap
+    val vsz = resultParsed("vsz").toLong
+    val rss = resultParsed("rss").toLong
+    Map(
+      "linuxMemoryVsz" -> vsz*1024,
+      "linuxMemoryRss" -> rss*1024
+    )
   }
 }

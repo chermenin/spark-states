@@ -33,7 +33,9 @@ libraryDependencies ++= Seq(
   // test dependencies
   "org.scalatest" %% "scalatest" % "3.0.5" % "test",
   "org.apache.spark" %% "spark-sql" % Versions.Spark % "test" classifier "tests",
-  "com.google.guava" % "guava-testlib" % "14.0.1" % "test"
+  "com.google.guava" % "guava" % "14.0.1" % "test", // override version because older version check expireAfterAccess as ">" instead of ">=" which makes unit tests fail
+  "com.google.guava" % "guava-testlib" % "14.0.1" % "test",
+  "com.github.dblock" % "oshi-core" % "3.4.0" % "test"
 )
 
 scmInfo := Some(

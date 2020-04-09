@@ -38,8 +38,8 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
     require(!StateStore.isMaintenanceRunning)
   }
 
-  test("Snapshotting") {
-    val provider = createStoreProvider(opId = Random.nextInt, partition = 0)
+  test("Versioning") {
+    val provider = createStoreProvider(opId = math.abs(Random.nextInt), partition = 0)
 
     var currentVersion = 0
 
@@ -56,15 +56,15 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
     updateVersionTo(2)
     assert(getData(provider) === Set(key -> 2))
 
-    assert(fileExists(provider, 1))
-    assert(fileExists(provider, 2))
+    assert(backupExists(provider, 1))
+    assert(backupExists(provider, 2))
 
     def verifySnapshot(version: Int): Unit = {
       updateVersionTo(version)
       provider.doMaintenance()
       require(getData(provider) === Set(key -> version), "store not updated correctly")
 
-      val snapshotVersion = (0 to version).filter(version => fileExists(provider, version)).min
+      val snapshotVersion = (0 to version).filter(version => backupExists(provider, version)).min
       assert(snapshotVersion >= minSnapshotToRetain(version), "no snapshot files cleaned up")
 
       assert(
@@ -83,7 +83,7 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
   }
 
   test("Cleaning up") {
-    val provider = createStoreProvider(opId = Random.nextInt, partition = 0)
+    val provider = createStoreProvider(opId = math.abs(Random.nextInt), partition = 1)
     val maxVersion = 20
 
     for (i <- 1 to maxVersion) {
@@ -94,7 +94,7 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
     }
     require(rowsToSet(provider.latestIterator()) === Set(key -> maxVersion), "store not updated correctly")
     for (version <- 1 until minSnapshotToRetain(maxVersion)) {
-      assert(!fileExists(provider, version)) // first snapshots should be deleted
+      assert(!backupExists(provider, version)) // first snapshots should be deleted
     }
 
     // last couple of versions should be retrievable
@@ -104,7 +104,7 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
   }
 
   test("Corrupted snapshots") {
-    val provider = createStoreProvider(opId = Random.nextInt, partition = 0)
+    val provider = createStoreProvider(opId = math.abs(Random.nextInt), partition = 2)
     for (i <- 1 to 6) {
       val store = provider.getStore(i - 1)
       put(store, key, i)
@@ -114,7 +114,7 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
     // clean up
     provider.doMaintenance()
 
-    val snapshotVersion = (0 to 10).filter(version => fileExists(provider, version)).max
+    val snapshotVersion = (0 to 10).filter(version => backupExists(provider, version)).max
     assert(snapshotVersion === 6)
 
     // Corrupt snapshot file
@@ -122,14 +122,16 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
     corruptSnapshot(provider, snapshotVersion)
 
     // Load data from previous correct snapshot
-    assert(getData(provider, snapshotVersion) === Set(key -> (snapshotVersion - 1)))
+    assert(getData(provider, snapshotVersion - 1) === Set(key -> (snapshotVersion - 1)))
 
     // Do cleanup and corrupt some more snapshots
     corruptSnapshot(provider, snapshotVersion - 1)
     corruptSnapshot(provider, snapshotVersion - 2)
 
-    // If no correct snapshots, create empty state
-    assert(getData(provider, snapshotVersion) === Set())
+    // If no correct snapshots, throw exception
+    intercept[IllegalStateException] {
+      getData(provider, snapshotVersion)
+    }
   }
 
   test("Reports metrics") {
@@ -144,7 +146,7 @@ class RocksDbStateStoreProviderSuite extends FunSuite with BeforeAndAfter {
   test("StateStore.get") {
     val dir = newDir()
     val storeId = StateStoreProviderId(StateStoreId(dir, 0, 0), UUID.randomUUID)
-    val storeConf = StateStoreConf.empty
+    val storeConf = StateStoreConf( RocksDbStateStoreHelper.createSQLConf(-1, false))
     val hadoopConf = new Configuration()
 
     // Verify that trying to get incorrect versions throw errors
