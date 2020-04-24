@@ -22,11 +22,11 @@ import java.util.concurrent.TimeUnit
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
+import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.SparkConf
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{SchemaHelper, functions}
+import org.apache.spark.sql.{SchemaUtils, functions}
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.state._
@@ -739,7 +739,7 @@ import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvide
         // create schema evolution projection
         val defaultValues = storeConf.confs.filterKeys(_.startsWith(STATE_SCHEMAEVOLUTION_DEFAULTVALUE_PREFIX))
           .map{ case (k,v) => (k.stripPrefix(STATE_SCHEMAEVOLUTION_DEFAULTVALUE_PREFIX+"."), functions.expr(v))}
-        val projection = SchemaHelper.getSchemaProjection(backupValueSchema.get, valueSchema, defaultValues)
+        val projection = SchemaUtils.getSchemaProjection(backupValueSchema.get, valueSchema, defaultValues)
         logInfo( s"value schema evolution needed for $this. Projection: $projection" )
         // migrate all records
         var recordCnt = 0
@@ -748,7 +748,7 @@ import ru.chermenin.spark.sql.execution.streaming.state.RocksDbStateStoreProvide
           val unsafeConverter = UnsafeProjection.create(valueSchema) // InternalRow -> UnsafeRow
           allKVIter.foreach {
             unsafeRowPair =>
-              val newValueRow = SchemaHelper.applySchemaProjection(unsafeRowPair.value, projection)
+              val newValueRow = SchemaUtils.applySchemaProjection(unsafeRowPair.value, projection)
               recordCnt = recordCnt + 1
               currentDb.put(unsafeRowPair.key.getBytes, unsafeConverter(newValueRow).getBytes)
           }
@@ -1280,6 +1280,9 @@ object RocksDbStateStoreProvider extends Logging {
     Try(value.toInt) match {
       case Success(v) => Some(v)
       case Failure(_) => None
+    }
+  }
+
   private def setWriteBufferSizeMb(conf: Map[String, String]): Int =
     Try(conf.getOrElse(WRITE_BUFFER_SIZE_MB, DEFAULT_WRITE_BUFFER_SIZE_MB.toString).toInt) match {
       case Success(value) => value
@@ -1303,7 +1306,6 @@ object RocksDbStateStoreProvider extends Logging {
       case Success(value) => value
       case Failure(e) => throw new IllegalArgumentException(e)
     }
-  }
 
   private def getTTL(expirySecs: String): Int = toInt(expirySecs) match {
     case Some(value) => value
