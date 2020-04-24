@@ -31,8 +31,8 @@ import scala.util.Random
 
 object RocksDbStateStoreHelper extends PrivateMethodTester {
 
-  val keySchema = StructType(Seq(StructField("key", StringType, nullable = true)))
-  val valueSchema = StructType(Seq(StructField("value", IntegerType, nullable = true)))
+  val keySchema: StructType = StructType(Seq(StructField("key", StringType, nullable = true)))
+  val valueSchema: StructType = StructType(Seq(StructField("value", IntegerType, nullable = true)))
 
   val key: String = "a"
   val batchesToRetain: Int = 3
@@ -128,6 +128,10 @@ object RocksDbStateStoreHelper extends PrivateMethodTester {
 
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_SECS, defaultTTL.toString)
     sqlConf.setConfString(RocksDbStateStoreProvider.STATE_EXPIRY_STRICT_MODE, isStrict.toString)
+
+    configs.foreach {
+      case (key, value) => sqlConf.setConfString(key, value)
+    }
 
     sqlConf
   }

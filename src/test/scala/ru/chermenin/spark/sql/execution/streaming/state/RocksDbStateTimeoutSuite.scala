@@ -40,26 +40,26 @@ class RocksDbStateTimeoutSuite extends FunSuite with BeforeAndAfter {
 
   final val testDBLocation: String = "testdb"
 
-  def withTTLStore(ttl: Long, sqlConf: SQLConf, pathSuffix: String = "")
+  private def withTTLStore(ttl: Long, sqlConf: SQLConf, pathSuffix: String = "")
                   (f: (FakeTicker, StateStore) => Unit): Unit = {
-    val stateStore = createTTLStore(ttl, sqlConf, testDBLocation + pathSuffix)
+    val (ticker, stateStore) = createTTLStore(ttl, sqlConf, testDBLocation + pathSuffix)
 
-    f(stateStore._1, stateStore._2)
-    stateStore._2.commit()
+    f(ticker, stateStore)
+    stateStore.commit()
+  }
+
+  private def stopAndCleanUp(): Unit = {
+    StateStore.stop()
+    require(!StateStore.isMaintenanceRunning)
+    performCleanUp(testDBLocation)
   }
 
   before {
-    StateStore.stop()
-    require(!StateStore.isMaintenanceRunning)
-
-    performCleanUp(testDBLocation)
+    stopAndCleanUp()
   }
 
   after {
-    StateStore.stop()
-    require(!StateStore.isMaintenanceRunning)
-
-    performCleanUp(testDBLocation)
+    stopAndCleanUp()
   }
 
   test("no timeout") {

@@ -155,9 +155,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       val valueCopy = value.copy()
       synchronized {
         store.put(keyCopy.getBytes, valueCopy.getBytes)
-
-        if (isStrictExpire)
+        if (isStrictExpire) {
           keyCache.put(keyCopy, DUMMY_VALUE)
+        }
       }
     }
 
@@ -168,9 +168,9 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       verify(state == State.Updating, "Cannot remove entry from already committed or aborted state")
       synchronized {
         store.delete(key.getBytes)
-
-        if (isStrictExpire)
+        if (isStrictExpire) {
           keyCache.invalidate(key.getBytes)
+        }
       }
     }
 
@@ -200,10 +200,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
 
       try {
         state = State.Committed
-        keysNumber =
-          if (isStrictExpire) keyCache.size
-          else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
-
+        keysNumber = if (isStrictExpire) {
+          keyCache.size
+        } else {
+          store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+        }
         store.close()
         putLocalSnapshot(newVersion, dbPath)
         snapshot(newVersion, dbPath)
@@ -222,10 +223,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
       verify(state != State.Committed, "Cannot abort already committed state")
       try {
         state = State.Aborted
-        keysNumber =
-          if (isStrictExpire) keyCache.size
-          else store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
-
+        keysNumber = if (isStrictExpire) {
+          keyCache.size
+        } else {
+          store.getLongProperty(ROCKSDB_ESTIMATE_KEYS_NUMBER_PROPERTY)
+        }
         store.close()
         putLocalSnapshot(newVersion + 1, dbPath)
         logInfo(s"Aborted version $newVersion for $this")
@@ -267,14 +269,11 @@ class RocksDbStateStoreProvider extends StateStoreProvider with Logging {
         }
       }
 
-      val stateIter = {
-        val keys = keyCache.asMap().keySet()
-
-        if (isStrictExpire) stateFromRocksIter.filter(x => keys.contains(x.key))
-        else stateFromRocksIter
+      if (isStrictExpire) {
+        stateFromRocksIter.filter(x => keyCache.asMap().keySet().contains(x.key))
+      } else {
+        stateFromRocksIter
       }
-
-      stateIter
     }
 
     /**
