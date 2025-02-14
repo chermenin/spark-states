@@ -4,7 +4,7 @@
 [![CodeFactor](https://www.codefactor.io/repository/github/chermenin/spark-states/badge)](https://www.codefactor.io/repository/github/chermenin/spark-states)
 [![codecov](https://codecov.io/gh/chermenin/spark-states/branch/master/graph/badge.svg)](https://codecov.io/gh/chermenin/spark-states)
 [![Maven Central](https://img.shields.io/maven-central/v/ru.chermenin/spark-states_2.12.svg)](https://central.sonatype.com/search?q=g%3Aru.chermenin++spark-states_*)
-[![javadoc](https://javadoc.io/badge2/ru.chermenin/spark-states_2.12/javadoc.svg)](https://javadoc.io/doc/ru.chermenin/spark-states_2.12)
+[![javadoc](https://javadoc.io/badge2/ru.chermenin/spark-states_2.12/javadoc.svg)](https://javadoc.io/doc/ru.chermenin/spark-states_2.12/latest/ru/chermenin/spark/sql/execution/streaming/state/RocksDbStateStoreProvider.html)
 
 State management extensions for Apache Spark to keep data across micro-batches during stateful stream processing.
 
