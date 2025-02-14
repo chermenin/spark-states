@@ -3,7 +3,8 @@
 [![Build Status](https://travis-ci.org/chermenin/spark-states.svg?branch=master)](https://travis-ci.org/chermenin/spark-states)
 [![CodeFactor](https://www.codefactor.io/repository/github/chermenin/spark-states/badge)](https://www.codefactor.io/repository/github/chermenin/spark-states)
 [![codecov](https://codecov.io/gh/chermenin/spark-states/branch/master/graph/badge.svg)](https://codecov.io/gh/chermenin/spark-states)
-[![Maven Central](https://img.shields.io/maven-central/v/ru.chermenin/spark-states_2.12.svg)](https://search.maven.org/search?q=g:ru.chermenin%20AND%20a:spark-states_*)
+[![Maven Central](https://img.shields.io/maven-central/v/ru.chermenin/spark-states_2.12.svg)](https://central.sonatype.com/search?q=g%3Aru.chermenin++spark-states_*)
+[![javadoc](https://javadoc.io/badge2/ru.chermenin/spark-states_2.12/javadoc.svg)](https://javadoc.io/doc/ru.chermenin/spark-states_2.12)
 
 State management extensions for Apache Spark to keep data across micro-batches during stateful stream processing.
 
